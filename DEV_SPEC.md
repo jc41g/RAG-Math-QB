@@ -101,3 +101,25 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
 这个规范的目的：避免把还没想清楚的设计硬编造成"看起来确定"的样子（虚假精确），也避免完全跳过不写导致排期表出现依赖关系空洞。
 
 ---
+
+## 4. 技术选型
+
+### 4.1 数据摄取流水线
+
+**目标：** 构建统一、可配置、可观测的题目摄取流水线，把图片、PDF、手动表单三种来源统一转换为结构化 `Question` 记录，供检索层消费。该能力应是可重用的库模块，供后台批量导入脚本、Streamlit Dashboard、学生即时提交入口（经辅导讲师 Agent 中转）共同调用。
+
+设计要点：
+
+- **不做 Chunking（切分）**：与通用文档 RAG 不同，本项目不引入 Splitter 层。原因见 `docs/DECISIONS.md`「数据摄取架构：不做 Chunking，但需要"多题目边界识别"」——单道题目的长度远低于 embedding 窗口限制，不存在需要切分的技术约束；检索与存储的最小单元就是一整道题。
+- **明确分层职责**：
+  - Loader：负责把原始输入（图片/PDF/表单）解析为统一的 `Question` 对象列表（类型定义集中在 `src/core/types.py`）。三种来源的输入形态本质不同（文件路径 / 结构化字典 / 图片二进制），因此 `BaseLoader.load()` **不强制统一参数签名**，只约束返回值必须是 `List[Question]`——即使输入只对应一道题，也返回长度为 1 的列表，保持下游 Pipeline 处理逻辑统一。
+  - `PdfLoader.load(file_path)`：从 PDF 题库文档中识别题目边界并抽取多道题目（核心任务是"识别有几道题、边界在哪"，而非文档转 Markdown）。
+  - `ImageLoader.load(image_data, source_hint)`：从图片中识别并抽取题目，供学生实时拍照（`source_hint="student_realtime"`，经辅导讲师 Agent 中转调用，见职责边界章节）与老师批量扫描（`source_hint="batch_scan"`）两种场景共用。**本 Loader 只做感知转换，不涉及理解学生意图、对话、错因判断**（那属于辅导讲师 Agent 的职责，见 `docs/DECISIONS.md`「图片识别能力归属」）。
+  - `ManualEntryLoader.load(form)`：接收 Streamlit Dashboard 手动录入的结构化表单，无需解析逻辑，恒定返回长度为 1 的列表。
+- **摄取记录（`ingestion_records`）与 `questions` 表分离**：记录来源媒介类型（image/pdf/manual）、原始文件引用、导入时间、导入批次、导入人（学生/管理员）。设计理由见 `docs/DECISIONS.md`「来源/摄取元数据独立建表」——题目表保持纯业务属性，摄取元数据是独立的生命周期/查询维度。
+- **触发入口**：学生即时提交（经辅导讲师 Agent 中转、单条）、后台管理员批量导入（多条，附带批次记录），两者复用同一 Pipeline，仅入口不同。
+- **Review-gate 过滤**：新识别出的题目默认 `review_status="pending"`，在老师审核通过前不参与任何检索（对应硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
+
+`Question` 核心字段（详见 §7 数据模型）：`id`、`stem`（题面）、`answer`（可为空，允许后续人工补充）、`metadata`（至少含 `chapter_code`、`subject_code`、`difficulty`、`review_status`）。
+
+---
