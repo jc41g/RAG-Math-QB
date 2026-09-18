@@ -166,4 +166,43 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
   - 所有提议写入类工具的返回内容，一律写入 `review_queue`（见 §7 数据模型），`review_status=pending`，审核通过前对检索完全不可见（硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
 - **返回内容设计**：默认返回类型为 TextContent（Markdown），保证最低兼容性；当检索结果关联题目图片时（几何题的图形），追加 ImageContent（Base64 编码），供支持渲染的 Client 使用，不支持的 Client 可降级为纯文本展示。
 
+### 4.4 可插拔架构
+
+**目标：** 定义清晰的抽象层与接口契约，使核心组件能够独立替换与升级，避免技术锁定。与通用文档 RAG 一致，不做改动——这一层是纯技术范式，与业务场景无关。
+
+设计原则（与通用文档 RAG 相同）：
+
+- **接口隔离**：为每类组件定义最小化抽象接口，上层业务逻辑仅依赖接口，不依赖具体实现。
+- **配置驱动**：通过 `config/settings.yaml` 指定各组件的具体后端，代码无需修改即可切换实现。
+- **工厂模式**：工厂函数根据配置动态实例化对应实现类，一处配置、处处生效。
+- **优雅降级**：首选后端不可用时，自动回退到备选方案或安全默认值。
+
+各组件抽象（沿用原版设计，具体默认 Provider 为待解锁任务，见 §8 末尾）：
+
+- **LLM / Embedding 提供者**：`BaseLLM`（`chat(messages) -> response`）、`BaseEmbedding`（`embed(texts) -> vectors`），统一屏蔽 Azure OpenAI / OpenAI / DeepSeek / Ollama 等不同 Provider 的认证与请求格式差异。
+- **Vision LLM 提供者**：`BaseVisionLLM`，支持文本+图片多模态输入，供 §4.1 `ImageLoader` 调用。这是本项目相对通用文档 RAG **优先级更高**的一环——通用文档 RAG 里 Vision LLM 只用于可选的图片描述增强，本项目里它是图片题目录入这一核心摄取路径的必需依赖。
+- **向量数据库**：`BaseVectorStore`（`.add()`/`.query()`/`.delete()`），默认 Chroma（嵌入式、零部署成本，适合本地开发与快速原型验证）。
+- **精排后端（Reranker）**：见 §4.2，None / Cross-Encoder / LLM Rerank 三种，工厂路由 + Fallback 语义。
+- **不需要 Splitter 抽象**：与通用文档 RAG 不同——本项目不做 Chunking（见 §4.1），因此不需要 `BaseSplitter`/`SplitterFactory` 这一层。
+
+**评估框架**：与通用文档 RAG 不同，本项目**主用自定义检索指标**（Hit Rate、MRR 等，衡量排序质量），不引入 Ragas——Ragas 的核心指标（Faithfulness、Answer Relevancy）面向"生成式回答质量"评测，本项目不做生成式回答，没有可用的评测对象。完整分析见 `docs/DECISIONS.md`「评估框架选型」。`BaseEvaluator` 抽象接口本身仍保留（`evaluate(...) -> metrics`），为未来接入其他检索类评估指标留出扩展空间，但默认实现只需覆盖自定义检索指标。
+
+**配置驱动示例**（`config/settings.yaml` 关键字段，与通用文档 RAG 结构一致，字段内容按本项目调整）：
+
+```yaml
+llm:
+  provider: TODO  # azure | openai | ollama | deepseek，具体选型为待解锁任务
+vision_llm:
+  provider: TODO  # 图片题目录入依赖，优先级高于通用文档 RAG 场景
+embedding:
+  provider: TODO
+vector_store:
+  backend: chroma
+retrieval:
+  fusion_algorithm: rrf
+  rerank_backend: none  # none | cross_encoder | llm
+evaluation:
+  backends: [custom_metrics]  # 不含 ragas，理由见 docs/DECISIONS.md
+```
+
 ---
