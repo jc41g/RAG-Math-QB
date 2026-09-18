@@ -112,6 +112,9 @@ nonexistent_traces.jsonl/
 # Private project docs (decisions/log/interview-prep) — kept local only, not published
 docs/
 
+# Personal workflow playbook — kept local only, not published
+CLAUDE.md
+
 # Third-party Agent Skills copied from an unlicensed reference repo (no LICENSE file present
 # upstream, so redistribution rights are unclear). Kept local for development use only.
 .claude/skills/
