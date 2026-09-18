@@ -138,4 +138,32 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
   - **Fallback 语义**：精排后端不可用/超时/失败时，必须回退到 Fusion 阶段排名，返回结果需显式标记是否使用了 Fallback 及原因，不能静默降级（面向可观测性，便于后续排查排序质量问题）。
 - **输出契约**：每条结果需包含 `score`、`score_breakdown`（各排序信号的分项得分，含多路径加分项）、`why_recommended`（简短说明命中原因，供辅导讲师 Agent 或 Dashboard 展示），不允许只返回裸分数——对应"排序质量是核心商业价值"的结论（见 `docs/DECISIONS.md`「技术选型验证」）。
 
+### 4.3 MCP 服务设计
+
+**目标：** 设计并实现一个符合 Model Context Protocol 规范的 Server，作为结构化题库上下文提供者，供辅导讲师 Agent（MCP Client）调用。
+
+设计要点：
+
+- **核心设计理念**：
+  - 协议优先：严格遵循 MCP 官方规范（JSON-RPC 2.0），只做协议合规实现，不写死专属于某个 Client 的非标准扩展——这为未来接入除辅导讲师 Agent 外的其他合规 MCP Client 保留了空间，但**本阶段不设计多租户/多调用方的权限治理机制**（触发条件与 REST API 一致：出现真实的第二调用方时才设计，见 `docs/DECISIONS.md`「对外接口形态」）。
+  - 排序理由透明：对应通用文档 RAG 的"引用透明"理念，本项目的等价物是 `score_breakdown` + `why_recommended`（见 §4.2），而非文档的 `source_file`/`page`/`chunk_id`。
+  - 单一确定 Client：不需要像通用文档 RAG 那样为不同 Client（Copilot vs Claude Desktop）设计差异化的降级/适配策略，因为当前唯一的 Client 就是辅导讲师 Agent，其能力边界由本项目团队自行定义。
+- **传输协议**：Stdio（本地子进程通信），与通用文档 RAG 设计一致——无需网络端口/鉴权，数据不经网络，`stdout` 仅输出合法 MCP 消息，日志统一走 `stderr`。
+- **SDK 选型**：优先采用 Python 官方 MCP SDK（`mcp`），复用其 `@server.tool()` 声明式定义方式，不自行实现协议底层细节。
+- **Tools 设计**：按职责分五类，共八个工具。
+
+| 类别 | 工具名称 | 功能描述 | 典型输入参数 | 输出特点 |
+|---|---|---|---|---|
+| 查询 | `lookup_canonical_steps` | 查询某章节下的候选标准步骤列表 | `chapter_code` | 标准步骤列表（含所属路径信息） |
+| 检索 | `search_questions` | 核心检索入口，见 §4.2 | `canonical_step_id`, `misconception_tag_id?`, `chapter_code?`, `difficulty?`, `top_k?` | 含 `score_breakdown`/`why_recommended` 的题目列表 |
+| 图片感知转换 | `ingest_question_from_image` | 图片转结构化题目，见 §4.1 | `image_data`, `source_hint` | 识别出的题目列表（`review_status=pending`） |
+| 提议写入 | `propose_canonical_step` | 提议新标准步骤 | 候选步骤内容 | 确认信息 + 提议记录 ID |
+| 提议写入 | `propose_misconception_tag` | 提议新错因标签 | 候选标签内容 | 确认信息 + 提议记录 ID |
+| 提议写入 | `propose_question_mapping` | 提议题目与标准步骤的映射，粒度覆盖单步骤与整条路径 | `question_id`, `step_ids`（长度 1 为单步骤映射，长度 >1 为路径提议） | 确认信息 + 提议记录 ID |
+| 反馈回流 | `submit_recommendation_feedback` | 记录学生/老师对某次推荐结果的反馈，作为未来 Rerank 权重迭代的数据来源 | `case_id`（对应某次检索结果）, `question_id`, `feedback`（有帮助/无帮助等） | 确认信息 |
+
+  - 所有"提议写入"与"反馈回流"类工具**只返回简洁确认（成功与否 + 对应记录 ID），不返回审核状态或详细内容**——调用方（辅导讲师 Agent）不需要在当前对话轮次追踪审核进度，这是本项目与通用文档 RAG 工具设计的一个刻意简化。
+  - 所有提议写入类工具的返回内容，一律写入 `review_queue`（见 §7 数据模型），`review_status=pending`，审核通过前对检索完全不可见（硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
+- **返回内容设计**：默认返回类型为 TextContent（Markdown），保证最低兼容性；当检索结果关联题目图片时（几何题的图形），追加 ImageContent（Base64 编码），供支持渲染的 Client 使用，不支持的 Client 可降级为纯文本展示。
+
 ---
