@@ -108,6 +108,11 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
 
 **目标：** 构建统一、可配置、可观测的题目摄取流水线，把图片、PDF、手动表单三种来源统一转换为结构化 `Question` 记录，供检索层消费。该能力应是可重用的库模块，供后台批量导入脚本、Streamlit Dashboard、学生即时提交入口（经辅导讲师 Agent 中转）共同调用。
 
+- **自研 Pipeline 框架（设计定位与 §4.4 可插拔架构一致，不依赖 LlamaIndex 等第三方 RAG 框架）**：
+  - 采用自定义抽象接口（`BaseLoader`/`BaseTransform`/`BaseEmbedding`/`BaseVectorStore`，无 `BaseSplitter`——本项目不做 Chunking，见下方说明），实现完全可控的可插拔架构。
+  - 支持可组合的 Loader → Transform → Embed → Upsert 流程（比通用文档 RAG 少一环 Splitter），便于实现可观测的流水线。
+  - 与主流 Embedding provider 有良好适配，架构中统一使用 Chroma 作为向量存储（与 §4.4 保持一致）。
+
 设计要点：
 
 - **不做 Chunking（切分）**：与通用文档 RAG 不同，本项目不引入 Splitter 层。原因见 `docs/DECISIONS.md`「数据摄取架构：不做 Chunking，但需要"多题目边界识别"」——单道题目的长度远低于 embedding 窗口限制，不存在需要切分的技术约束；检索与存储的最小单元就是一整道题。
@@ -119,6 +124,103 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
 - **摄取记录（`ingestion_records`）与 `questions` 表分离**：记录来源媒介类型（image/pdf/manual）、原始文件引用、导入时间、导入批次、导入人（学生/管理员）。设计理由见 `docs/DECISIONS.md`「来源/摄取元数据独立建表」——题目表保持纯业务属性，摄取元数据是独立的生命周期/查询维度。
 - **触发入口**：学生即时提交（经辅导讲师 Agent 中转、单条）、后台管理员批量导入（多条，附带批次记录），两者复用同一 Pipeline，仅入口不同。
 - **Review-gate 过滤**：新识别出的题目默认 `review_status="pending"`，在老师审核通过前不参与任何检索（对应硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
+- **Dedup & Normalize（去重与归一化）**：在写入向量库前运行去重检查——与通用文档 RAG 一致，防止重复索引，具体机制见下方"前置去重"与"幂等性设计"两节。
+
+**前置去重（Early Exit / File Integrity Check）**（与通用文档 RAG 一致，直接复用；对本项目同样必需——老师重复上传同一份 PDF 题库或同一张错题图片，不应重新触发一遍完整的识别+向量化流程）：
+
+- **机制**：在解析文件/图片前，计算原始输入的 SHA256 哈希指纹。
+- **动作**：检索 `ingestion_history` 表，若发现相同哈希且状态为 `success` 的记录，直接跳过后续所有处理（识别、向量化），实现零成本增量更新。
+- **表结构**：
+
+```sql
+CREATE TABLE ingestion_history (
+    input_hash    TEXT PRIMARY KEY,   -- SHA256(原始文件/图片内容)
+    source_type   TEXT NOT NULL CHECK(source_type IN ('image', 'pdf', 'manual')),
+    status        TEXT NOT NULL CHECK(status IN ('success', 'failed', 'processing')),
+    processed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    error_msg     TEXT,
+    question_count INTEGER            -- 该次摄取识别出的题目数
+);
+CREATE INDEX idx_status ON ingestion_history(status);
+```
+
+- **查询逻辑**：`SELECT status FROM ingestion_history WHERE input_hash = ? AND status = 'success'`。命中则跳过。
+- **手动录入（`ManualEntryLoader`）不适用此机制**——表单提交没有"原始文件"概念，每次提交视为新内容，去重交由 `questions` 表本身的内容层面幂等（见下方幂等性设计）处理。
+
+> **📌 持久化存储架构统一说明**
+>
+> 本项目在多个模块中采用 **SQLite** 作为轻量级持久化存储方案，避免引入重量级数据库依赖，保持本地优先（Local-First）的设计理念：
+>
+> | 存储模块 | 数据库文件 | 用途 | 表结构关键字段 |
+> |---------|-----------|------|---------------|
+> | **文件完整性检查** | `data/db/ingestion_history.db` | 记录已处理输入的 SHA256 哈希，实现增量摄取 | `input_hash`, `status`, `processed_at` |
+> | **图片索引映射** | `data/db/image_index.db` | 记录题目关联图形文件的 `image_id → 文件路径` 映射，支持图片检索与引用 | `image_id`, `file_path`, `question_id` |
+> | **BM25 索引元数据** | `data/db/bm25/` | 存储倒排索引和 IDF 统计信息（未来可扩展用 SQLite） | 当前使用 pickle，可迁移至 SQLite |
+>
+> **设计优势**：
+> - **零依赖部署**：无需安装 MySQL/PostgreSQL 等数据库服务，`pip install` 即可运行——对应本项目"个人可维护、可部署到教育机构本地环境"的定位。
+> - **并发安全**：WAL（Write-Ahead Logging）模式支持多进程安全读写（学生提交与管理员批量导入可能并发发生）。
+> - **持久化保证**：摄取历史和索引映射在进程重启后自动恢复，避免重复计算。
+> - **架构一致性**：所有 SQLite 模块遵循相同的初始化、查询与错误处理模式，便于维护与扩展。
+>
+> **升级路径**：当题库规模扩展至多机构、分布式部署场景时，可通过统一的抽象接口将 SQLite 替换为 PostgreSQL 或 Redis，无需修改上层业务逻辑。
+
+**Transform 阶段：结构清洗（仅 `PdfLoader`/`ImageLoader` 场景，`ManualEntryLoader` 跳过）**：
+
+- 对识别出的题面文本做规则去噪（剔除页眉页脚、乱码、多余空白），确保入库的 `Question.stem` 是自包含、干净的文本——与通用文档 RAG 的"智能重组"对应，但不涉及"合并被物理切断的段落"（不适用，本项目没有跨块合并的场景）。
+- **语义元数据注入（Semantic Metadata Enrichment，仅 `PdfLoader` 批量场景，题目量较大时才有意义）**：在基础元数据（章节、来源）之上，利用 LLM 为每道题目自动生成 `topic_tags`（知识点标签，如"相似三角形""平行线判定"），注入 `metadata` 字段，用于支撑 Dashboard 题库浏览器的筛选与统计维度。与通用文档 RAG 的 `Title`/`Summary`/`Tags` 三件套不同，本项目题目本身已有 `stem`（相当于自带摘要）、`chapter_code`（相当于自带分类），不需要额外生成标题和摘要，只需要这一层知识点标签补充。
+- 原子化与幂等：单道题目的清洗失败不阻塞同批次其他题目的处理，失败题目单独标记 `metadata.transform_failed=true`，进入待审核队列由老师判断。
+
+**Embedding 阶段（双路向量化）**：
+
+- **差量计算（Incremental Embedding / Cost Optimization）**：在调用 Embedding API 前，计算 `Question.stem` 的内容哈希（`content_hash`）。仅对数据库中不存在的新内容哈希执行向量化计算；若题目文本未变但其他字段（如 `difficulty`）被老师编辑，直接复用已有向量，避免重复计费。
+- **核心策略**：为支持高精度的混合检索（Hybrid Search），系统对每道题目并行执行双路编码计算：
+  - **Dense Embeddings（语义向量）**：调用 Embedding 模型生成高维浮点向量，捕捉题面的深层语义关联——对应 §4.2 Dense Route 依赖的向量来源，解决"标签相同、具体条件不同"的检索难题。
+  - **Sparse Embeddings（稀疏向量）**：利用 BM25 编码器生成稀疏向量（关键词权重），捕捉精确的关键词匹配信息——对应 §4.2 Sparse Route 依赖的索引来源，解决专有名词（如特定几何术语）查找问题。
+- **批处理优化**：向量化计算采用 `batch_size` 驱动的批处理模式（而非逐题调用 API），最大化吞吐并减少网络往返（RTT）——老师批量导入一份 PDF 题库可能一次产生几十道新题，逐题调用会显著拖慢摄取速度。
+
+**Upsert & Storage（索引存储）**：
+
+- **存储后端**：统一使用向量数据库（Chroma）作为存储引擎，同时持久化 Dense Vector、Sparse Vector 以及 Transform 阶段生成的富 metadata。
+- **All-in-One 存储策略**：执行原子化存储，每条 `QuestionRecord` 同时包含：
+  1. **Index Data**：用于计算相似度的 Dense Vector 和 Sparse Vector。
+  2. **Payload Data**：完整的题目原始内容（`stem`/`answer`）及 metadata。
+
+  机制优势：检索命中 `question_id` 后能立即取回题面、答案等完整信息，无需额外查库操作（Lookup），保障检索阶段的毫秒级响应——对应辅导讲师 Agent 实时对话场景对检索延迟的要求。
+
+**幂等性设计（`Question.id` 生成算法）**：
+
+- `id = hash(source_type + source_ref + content_hash)`——`source_type`/`source_ref` 来自 `ingestion_records`，`content_hash` 是题面内容哈希。同一来源、同一内容重复摄取产生相同 `id`，写入时采用 Upsert 语义，确保不产生重复记录。
+- 手动录入场景 `source_ref` 为空，`id` 退化为 `hash("manual" + content_hash)`——意味着两位老师各自手动录入完全相同的题面会被判定为同一题目并合并，这是刻意设计（避免重复题目污染题库），而非缺陷。
+- **原子性保证**：以 Batch 为单位进行事务性写入（一批题目要么全部成功入库，要么全部回滚），确保索引状态的一致性——避免批量导入中途失败导致部分题目有向量无 metadata、或有 metadata 无向量的不一致状态。
+
+**题目生命周期管理（`QuestionManager`，对应通用文档 RAG 的 `DocumentManager`，支撑 Dashboard 题库浏览器/摄取管理页）**：
+
+- 独立模块 `src/ingestion/question_manager.py`，负责跨存储的协调操作：
+  - `list_questions(chapter_code?, review_status?) -> List[QuestionInfo]`：列出题目及统计信息（关联标准步骤数、摄取时间、来源类型）。
+  - `get_question_detail(question_id) -> QuestionDetail`：获取单道题目的详细信息（题面、答案、metadata、关联图片、`ingestion_records` 溯源信息）。
+  - `delete_question(question_id) -> DeleteResult`：协调删除跨存储的关联数据：
+    1. **VectorStore** — 删除该题目的 dense/sparse 向量
+    2. **`ingestion_records`** — 删除对应摄取记录
+    3. **`ingestion_history`** — 若该题目是某次摄取的唯一产出，移除处理记录，使原始输入可重新摄取
+    4. **图片文件**（若有）— 删除关联的题目图形文件
+  - `get_chapter_stats(chapter_code?) -> ChapterStats`：返回章节级统计（题目数、待审核数、存储大小）。
+
+**Pipeline 进度回调**（与通用文档 RAG 一致，直接复用，支撑 Dashboard 摄取管理页的实时进度条）：
+
+```python
+def run(self, source: Any, source_type: str,
+        on_progress: Callable[[str, int, int], None] | None = None) -> IngestionResult:
+```
+
+- 回调签名：`on_progress(stage_name: str, current: int, total: int)`。
+- 各阶段（load / transform / embed / upsert）处理每个 batch 时调用回调。`on_progress` 为 `None` 时行为不受影响，不影响 CLI 和测试场景。
+
+**存储层接口扩展**（支撑 `QuestionManager` 的删除操作）：
+
+- `BaseVectorStore` 新增 `delete_by_id(question_id: str) -> bool`
+- `BM25Indexer` 新增 `remove_document(question_id: str) -> None` — 移除指定题目的倒排索引条目，对应 `delete_question` 步骤中"删除该题目的 dense/sparse 向量"里 sparse 一侧的具体接口
+- `FileIntegrityChecker`（封装 `ingestion_history` 表操作）新增 `remove_record(input_hash: str) -> None` 和 `list_processed() -> List[dict]`
 
 **数据类型分层（对应通用文档 RAG 的 Document → Chunk → ChunkRecord 三层，本项目因不做 Chunking 而简化为两层）**：
 
@@ -158,24 +260,38 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 
 ### 4.2 检索流水线
 
-**目标：** 给定辅导讲师 Agent 传入的结构化错因信息，检索并排序出对症的练习题。与通用文档 RAG 不同，本模块的输入不是"待消歧的自由文本查询"，而是**已经结构化的错因描述**——标准步骤 ID、可选的错因标签 ID、章节、难度——上游的语义理解、路径判断、自由文本归一化工作已由辅导讲师 Agent 完成，本模块只负责"拿结构化条件找题、排序"。
+**目标：** 给定辅导讲师 Agent 传入的结构化错因信息，检索并排序出对症的练习题。本模块实现核心的检索引擎，采用"多阶段过滤（Multi-stage Filtering）"架构——先用结构化条件层层收窄候选范围，再用语义排序精确排出对症程度。与通用文档 RAG 不同，本模块的输入不是"待消歧的自由文本查询"，而是**已经结构化的错因描述**——标准步骤 ID、可选的错因标签 ID、章节、难度——上游的语义理解、路径判断、自由文本归一化工作已由辅导讲师 Agent 完成，本模块只负责"拿结构化条件找题、排序"。
 
 设计要点：
 
-- **Query 输入契约**：`ProcessedQuery` 不做关键词提取/同义词扩展（那是通用文档 RAG 应对自由文本查询的手段，本场景输入已结构化，不适用）。完整字段：
+- **核心假设**（对应通用文档 RAG 的"输入已消歧"假设）：输入的 `ProcessedQuery` 已由上游辅导讲师 Agent 完成语义理解与结构化——具体来说，Agent 已经把学生的自由文本错误描述归一化为 `canonical_step_id`（可能还完成了多路径判断，决定学生的错误对应哪条候选路径中的哪个节点，但这个判断结果本身不会作为参数直接传入，因为本模块的路径匹配是基于命中的 `canonical_step_id` 反查候选题目关联的路径，而非接收一个"路径 ID"参数）。本模块**不做任何语义理解层面的二次确认**——如果传入的 `canonical_step_id` 不存在于 taxonomy 中，直接返回空结果 + 明确错误信息，不做模糊匹配或猜测。这个假设是职责边界的直接延伸（见 `docs/DECISIONS.md`「职责边界」），必须在这里显式写出，因为它决定了本模块的输入校验策略——校验"格式是否合法"，不校验"语义是否合理"（语义合理性是上游 Agent 的职责）。
+- **Query 输入契约**：`ProcessedQuery` 完整字段：
   - `canonical_step_id: str`（必填）
   - `misconception_tag_id: Optional[str]`
   - `chapter_code: Optional[str]`
   - `difficulty: Optional[int]`
   - `top_k: int`（默认值为待解锁任务，当前占位 10）
   - `exclude_question_ids: List[str]`（可选，用于排除学生已经做过的题，默认空列表）
-  - 无 `keywords`/`expanded_terms` 字段——这两个字段服务于自由文本查询的关键词提取/同义词扩展，本场景输入本身已结构化，不需要这一步预处理。
-- **结构化过滤（硬过滤，前置）**：`review_status != approved` 的题目、以及不满足 `chapter_code`/`canonical_step_id` 硬约束的候选，在检索前直接排除，不进入候选集。对应 `docs/DECISIONS.md`「技术选型验证」中确立的"结构化过滤 + 语义排序"分工原则——能用结构化字段精确排除的，不留给语义层判断。
-- **Hybrid Search（粗排召回）**：与通用文档 RAG 设计一致，不做改动——Dense Route（题面 Embedding 相似度，捕捉"标签相同、具体条件不同"的语义差异，几何题的图形构造差异即典型场景）+ Sparse Route（BM25 关键词检索）+ RRF 融合（`Score = 1 / (k + Rank_Dense) + 1 / (k + Rank_Sparse)`，`k` 可配置）。
+  - `reference_stem: Optional[str]`（学生当前做错的这道题的题面文本，辅导讲师 Agent 若持有则传入，用于驱动 Dense Route 语义检索；不提供时 Dense Route 跳过，仅用 Sparse + 结构化过滤，检索质量会降级但不阻断流程——见下方 Hybrid Search Execution）
+  - 无 `keywords`/`expanded_terms` 字段——这两个字段服务于自由文本查询的关键词提取/同义词扩展，本项目的核心结构化字段不需要这层转换。
+- **查询转换与扩张策略（对应通用文档 RAG 此节，本项目判定不适用）**：原版此节包含 Keyword Extraction（NLP 提取关键实体生成稀疏检索 Token）和 Query Expansion（同义词/别名扩展）两个机制，目的是把自由文本查询转化为适合检索的形式。本项目的核心结构化字段不需要这层转换；但 `reference_stem`（若提供）仍需要基础的分词/关键词提取供 Sparse Route 使用——这部分复用与通用文档 RAG 相同的 NLP 处理，只是触发条件从"总是执行"变成"仅当 `reference_stem` 存在时执行"。
+- **Metadata Filtering 完整策略**（与通用文档 RAG 一致，原则为"先解析、能前置则前置、无法前置则后置兜底"）：
+  - **硬过滤 / 前置（Pre-filter）**：`review_status != approved` 的题目、以及 `chapter_code`/`canonical_step_id` 不满足的候选，在 Dense/Sparse 检索阶段之前直接排除，不进入候选集——因为这些是索引层面可精确支持的结构化字段，前置能缩小候选集、降低成本。对应 `docs/DECISIONS.md`「技术选型验证」中确立的"结构化过滤 + 语义排序"分工原则。
+  - **硬过滤 / 后置（Post-filter，safety net）**：`misconception_tag_id`（可选字段，题目数据里可能缺失该标注）在 Rerank 前统一做后置过滤——若题目未标注错因标签，默认"宽松包含"（missing→include），不因标注缺失而误杀本该召回的候选，避免因数据标注不完整导致漏检。
+  - **软偏好（Soft Preference）**：`difficulty` 不做硬过滤（学生错因对应的标准步骤，难度相近但不完全相等的题目依然有练习价值），而是作为 Rerank 阶段的排序信号之一参与加权（对应"难度匹配"这一分项，见下方 Rerank 权重）。
+- **Hybrid Search Execution（双路混合检索）**：
+  - **并行召回（Parallel Execution）**：
+    - **Dense Route**：仅当 `reference_stem` 存在时执行——计算 `reference_stem` 的 Embedding → 检索向量库（Cosine Similarity，检索范围是已通过结构化过滤的候选集合）→ 返回 Top-N 语义候选。`reference_stem` 缺失时跳过此路，直接进入 Sparse Route 结果。这一路捕捉"标签相同、具体条件不同"的语义差异（几何题的图形构造差异即典型场景），对应 `docs/DECISIONS.md`「技术选型验证」六点论证中的第一点。
+    - **Sparse Route**：对 `reference_stem`（若有）做关键词提取 → BM25 算法检索倒排索引 → 返回 Top-N 关键词候选；若 `reference_stem` 也缺失，Sparse Route 退化为仅按结构化字段过滤，不做关键词打分（此时排序完全依赖 Rerank 阶段的结构化匹配度）。
+    - Top-N 数量：与 Rerank 的 Top-M 同为待解锁任务的可调参数（见 §8 末尾），当前占位 20。
+  - **结果融合（Fusion）**：
+    - 采用 RRF（Reciprocal Rank Fusion）算法，不依赖 Dense/Sparse 各路分数的绝对值（两路量纲不同，直接比较无意义），而是基于排名的倒数进行加权融合，平滑因单一模态缺陷导致的漏召回。
+    - 公式：`Score = 1 / (k + Rank_Dense) + 1 / (k + Rank_Sparse)`，`k` 可配置。
+    - **单路降级场景**：`reference_stem` 缺失导致 Dense Route 未执行时，Fusion 直接使用 Sparse Route 排名（不套用 RRF 公式，因为只有一路数据）。
 - **多路径匹配加分（本项目特有设计）**：候选题目可能关联多条标准步骤路径（`step_sequence`，见 §7 数据模型的多对多关系）。若同一题目的多条路径都命中传入的 `canonical_step_id`，视为该题对这个错误步骤更有代表性，给予小幅加分；命中单条路径的题目不因"存在其他不相关路径"而受影响。**加分幅度必须受控（远小于标准步骤匹配/错因匹配等主信号权重）**，避免"路径数量多"本身压过"是否真正对症"这个核心排序目标——具体加分系数为待解锁任务（见 §8 末尾），当前用小值占位。**路径本身是审核录入阶段的静态数据，本模块只做路径命中判断与加分，不做路径推理**（硬边界，见 `docs/DECISIONS.md`）。
 - **Rerank（精排）**：
   - 候选集按标准步骤匹配度、错因标签匹配度、题面语义相似度、章节匹配、难度匹配、多路径命中加分共同加权排序，具体权重公式为待解锁任务（见 §8 末尾），当前用等权重占位跑通链路。
-  - 可插拔后端：None（直接用 Fusion 排名）/ Cross-Encoder / LLM Rerank，与通用可插拔架构一致（见 §4.4）。
+  - 可插拔后端：None（直接用 Fusion 排名）/ Cross-Encoder / LLM Rerank，与通用可插拔架构一致（见 §4.4）。候选数量参数（Top-M，与通用文档 RAG 一致，本项目规模更小仍沿用同一档位）：Cross-Encoder 默认对 Top-M=10~30 的候选执行精排；LLM Rerank 候选数更小（M≤20），控制成本与稳定性，要求输出严格结构化格式（JSON 格式的排序后 `question_id` 列表）。
   - **Fallback 语义**：精排后端不可用/超时/失败时，必须回退到 Fusion 阶段排名，返回结果需显式标记是否使用了 Fallback 及原因，不能静默降级（面向可观测性，便于后续排查排序质量问题）。
 - **输出契约**：`RetrievalResult` 完整字段（每个检索阶段——Dense/Sparse/Fusion/Rerank——都以此类型作为候选的统一表示，各阶段只更新 `score`/`stage_scores`，不改变类型结构）：
   - `question_id: str`
@@ -194,12 +310,34 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 
 - **核心设计理念**：
   - 协议优先：严格遵循 MCP 官方规范（JSON-RPC 2.0），只做协议合规实现，不写死专属于某个 Client 的非标准扩展——这为未来接入除辅导讲师 Agent 外的其他合规 MCP Client 保留了空间，但**本阶段不设计多租户/多调用方的权限治理机制**（触发条件与 REST API 一致：出现真实的第二调用方时才设计，见 `docs/DECISIONS.md`「对外接口形态」）。
-  - 排序理由透明：对应通用文档 RAG 的"引用透明"理念，本项目的等价物是 `score_breakdown` + `why_recommended`（见 §4.2），而非文档的 `source_file`/`page`/`chunk_id`。
+  - 排序理由透明：对应通用文档 RAG 的"引用透明"理念，本项目的等价物是 `score_breakdown` + `why_recommended`（见 §4.2），而非文档的 `source_file`/`page`/`chunk_id`。具体结构上，`search_questions` 返回的每道题目在 `structuredContent` 中采用统一格式：
+    ```json
+    {
+      "questions": [
+        {
+          "question_id": "q_8f3a2b",
+          "score": 0.87,
+          "score_breakdown": {
+            "canonical_step_match": 0.9,
+            "misconception_match": 0.8,
+            "dense_similarity": 0.75,
+            "multi_path_bonus": 0.05
+          },
+          "why_recommended": "该题标准步骤与错因标签均命中，题面语义与学生原题高度相似",
+          "matched_path_ids": ["path_012"]
+        }
+      ]
+    }
+    ```
+    同时在 `content` 数组第一项提供 Markdown 格式的人类可读摘要（题目列表 + 简短推荐理由），保证辅导讲师 Agent 无论是否解析 `structuredContent` 都能拿到可用信息——与通用文档 RAG"始终在 content 第一项提供纯文本兜底"的原则一致。
   - 单一确定 Client：不需要像通用文档 RAG 那样为不同 Client（Copilot vs Claude Desktop）设计差异化的降级/适配策略，因为当前唯一的 Client 就是辅导讲师 Agent，其能力边界由本项目团队自行定义。
+  - **开箱即用（Zero-Config for Client）**：辅导讲师 Agent 端接入本 Server 无需任何特殊配置，只需在其 MCP 配置中添加启动命令即可使用全部工具——这是 Stdio Transport 的天然优势，也延续到工具设计层面：所有工具的参数和返回值都是自解释的结构化数据，不需要额外的接入文档或握手流程。
+  - **多模态友好（Multimodal-Ready）**：返回格式同时支持文本与图像内容类型（见下方"返回内容设计"），几何题的图形是本项目的核心场景之一，多模态支持不是预留扩展，而是当前就要用到的能力。
 - **传输协议**：Stdio（本地子进程通信），与通用文档 RAG 设计一致——无需网络端口/鉴权，数据不经网络，`stdout` 仅输出合法 MCP 消息，日志统一走 `stderr`。
 - **SDK 选型**：优先采用 Python 官方 MCP SDK（`mcp`），复用其 `@server.tool()` 声明式定义方式，不自行实现协议底层细节。
+- **SDK 备选方案**：若未来需要深度定制 HTTP 行为（自定义中间件、复杂鉴权流程）或出现独立于辅导讲师 Agent 的第二调用方（触发 REST API 的场景，见 `docs/DECISIONS.md`「对外接口形态」），可考虑 FastAPI + 自定义协议层；权衡是开发成本更高，需自行实现能力协商（Capability Negotiation）、错误码映射，且需持续跟进协议版本更新。本阶段无此需求，官方 SDK 已充分满足。
 - **协议版本协商**：跟踪 MCP 最新稳定版本，在 `initialize` 阶段完成 Client/Server 能力协商，确保兼容性，与通用文档 RAG 一致，不做改动。
-- **Tools 设计**：按职责分五类，共八个工具。
+- **Tools 设计**：Server 通过 `tools/list` 向辅导讲师 Agent 注册可调用的工具函数，设计遵循"单一职责、参数明确、输出丰富"原则——每个工具只做一件事（查询/检索/转换/提议/反馈五类不混合），参数语义清晰不复用，返回值携带足够信息支撑调用方决策（如 `score_breakdown`），不要求调用方二次查询补全上下文。按职责分五类，共八个工具。
 
 | 类别 | 工具名称 | 功能描述 | 典型输入参数 | 输出特点 |
 |---|---|---|---|---|
@@ -219,6 +357,8 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 
 **目标：** 定义清晰的抽象层与接口契约，使核心组件能够独立替换与升级，避免技术锁定。与通用文档 RAG 一致，不做改动——这一层是纯技术范式，与业务场景无关。
 
+**术语说明**：本节中的"提供者（Provider）"、"实现（Implementation）"指的是完成某项功能的**具体技术方案**，而非传统 Web 架构中的"后端服务器"。例如，LLM 提供者可以是远程的 Azure OpenAI API，也可以是本地运行的 Ollama；向量存储可以是本地嵌入式的 Chroma，也可以是云端托管的 Pinecone。本项目作为本地 MCP Server，通过统一接口对接这些不同的提供者，实现灵活切换。
+
 设计原则（与通用文档 RAG 相同）：
 
 - **接口隔离**：为每类组件定义最小化抽象接口，上层业务逻辑仅依赖接口，不依赖具体实现。
@@ -226,15 +366,45 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 - **工厂模式**：工厂函数根据配置动态实例化对应实现类，一处配置、处处生效。
 - **优雅降级**：首选后端不可用时，自动回退到备选方案或安全默认值。
 
+**通用结构示意（适用于 LLM/Embedding、向量数据库、精排后端等各可插拔组件）**：
+
+```
+业务代码
+  │
+  ▼
+<Component>Factory.get_xxx()  ← 读取配置，决定用哪个实现
+  │
+  ├─→ ImplementationA()
+  ├─→ ImplementationB()
+  └─→ ImplementationC()
+      │
+      ▼
+    都实现了统一的抽象接口
+```
+
 各组件抽象（沿用原版设计，具体默认 Provider 为待解锁任务，见 §8 末尾）：
 
-- **LLM / Embedding 提供者**：`BaseLLM`（`chat(messages) -> response`）、`BaseEmbedding`（`embed(texts) -> vectors`），统一屏蔽 Azure OpenAI / OpenAI / DeepSeek / Ollama 等不同 Provider 的认证与请求格式差异。
-- **Vision LLM 提供者**：`BaseVisionLLM`，支持文本+图片多模态输入，供 §4.1 `ImageLoader` 调用。这是本项目相对通用文档 RAG **优先级更高**的一环——通用文档 RAG 里 Vision LLM 只用于可选的图片描述增强，本项目里它是图片题目录入这一核心摄取路径的必需依赖。
-- **向量数据库**：`BaseVectorStore`（`.add()`/`.query()`/`.delete()`），默认 Chroma（嵌入式、零部署成本，适合本地开发与快速原型验证）。
-- **精排后端（Reranker）**：见 §4.2，None / Cross-Encoder / LLM Rerank 三种，工厂路由 + Fallback 语义。
-- **不需要 Splitter 抽象**：与通用文档 RAG 不同——本项目不做 Chunking（见 §4.1），因此不需要 `BaseSplitter`/`SplitterFactory` 这一层。
+- **LLM / Embedding 提供者**：`BaseLLM`（`chat(messages) -> response`）、`BaseEmbedding`（`embed(texts) -> vectors`），统一屏蔽不同 Provider 的认证与请求格式差异。
 
-**评估框架**：与通用文档 RAG 不同，本项目**主用自定义检索指标**（Hit Rate、MRR 等，衡量排序质量），不引入 Ragas——Ragas 的核心指标（Faithfulness、Answer Relevancy）面向"生成式回答质量"评测，本项目不做生成式回答，没有可用的评测对象。完整分析见 `docs/DECISIONS.md`「评估框架选型」。`BaseEvaluator` 抽象接口本身仍保留（`evaluate(...) -> metrics`），为未来接入其他检索类评估指标留出扩展空间，但默认实现只需覆盖自定义检索指标。
+  | 提供者类型 | 典型场景 | 配置切换点 |
+  |---------|---------|-----------|
+  | **Azure OpenAI** | 企业合规、私有云部署、区域数据驻留 | `provider: azure`, `endpoint`, `api_key`, `deployment_name` |
+  | **OpenAI 原生** | 通用开发、最新模型尝鲜 | `provider: openai`, `api_key`, `model` |
+  | **DeepSeek / 其他云端** | 成本优化、特定语言优化 | `provider: deepseek`, `api_key`, `model` |
+  | **Ollama / vLLM（本地）** | 完全离线、隐私敏感、无 API 成本——教育机构本地部署场景下的重要选项 | `provider: ollama`, `base_url`, `model` |
+
+  - **中间层取舍**：对于生产可靠性要求更高的场景，可在 Provider 抽象基础上增加统一的重试、限流、日志中间层；本项目当前规模（单机构/小流量）暂不实现，这里仅记录思路，留待真实并发压力出现时再引入。
+- **Vision LLM 提供者**：`BaseVisionLLM`，支持文本+图片多模态输入，供 §4.1 `ImageLoader` 调用。这是本项目相对通用文档 RAG **优先级更高**的一环——通用文档 RAG 里 Vision LLM 只用于可选的图片描述增强，本项目里它是图片题目录入这一核心摄取路径的必需依赖。
+
+**设计模式：抽象工厂模式**——向量数据库、精排后端等检索层组件的可插拔性依赖两层设计：（1）自研的统一抽象接口（`BaseVectorStore` 等），不同实现只需遵循相同接口即可无缝替换；（2）工厂函数路由（如 `vector_store_factory.py`），根据 `settings.yaml` 配置自动实例化对应实现，做到"改配置不改代码"。
+
+- **向量数据库**：`BaseVectorStore`（`.add()`/`.query()`/`.delete()`），默认 **Chroma**。相比 Qdrant/Milvus/Weaviate 等需要 Docker 容器或分布式架构支撑的方案，Chroma 采用嵌入式设计，`pip install chromadb` 即可使用，无需额外部署数据库服务——契合本项目"教育机构本地可部署"的定位（与 §4.1 SQLite 选型的"本地优先"理念一致）。
+- **向量编码策略**：可选纯稠密编码（Dense Only，仅语义向量，适合通用场景）、纯稀疏编码（Sparse Only，仅关键词权重，适合精确匹配）、双路编码（Dense + Sparse，为混合检索提供数据基础）。本项目采用**双路编码**（具体机制见 §4.1 Embedding 阶段），为 §4.2 的 Hybrid Search 提供数据基础；`reference_stem` 缺失时 Dense 向量本身不生成，属于查询时的降级，不影响摄取阶段仍对题面执行双路编码。
+- **召回策略**：可选纯稠密召回（仅语义向量匹配）、纯稀疏召回（仅 BM25 关键词匹配）、混合召回（Dense+Sparse 并行+融合）、混合召回+精排。本项目采用**混合召回+精排**（完整机制见 §4.2 Hybrid Search Execution + Rerank），架构上预留了纯稠密/纯稀疏降级路径——这正是 `reference_stem` 缺失时 Dense Route 跳过、系统仍可用的技术基础。
+- **精排后端（Reranker）**：见 §4.2，None / Cross-Encoder / LLM Rerank 三种，工厂路由 + Fallback 语义。
+- **不需要 Splitter 抽象**：与通用文档 RAG 不同——本项目不做 Chunking（见 §4.1），因此不需要 `BaseSplitter`/`SplitterFactory` 这一层。通用文档 RAG 在这一层通常需要在固定长度切分/递归字符切分/语义切分/结构感知切分四种策略间权衡；本项目题目本身就是完整检索单元，这四种策略均无适用对象，不存在"选哪种分块"的决策。
+
+**评估框架**：与通用文档 RAG 不同，本项目**主用自定义检索指标**（Hit Rate、MRR 等，衡量排序质量），不引入 Ragas——Ragas 的核心指标（Faithfulness、Answer Relevancy）面向"生成式回答质量"评测，本项目不做生成式回答，没有可用的评测对象。完整分析见 `docs/DECISIONS.md`「评估框架选型」。`BaseEvaluator` 抽象接口本身仍保留，暴露 `evaluate(query, retrieved_questions, ground_truth) -> metrics`（相比原版 `evaluate(query, retrieved_chunks, generated_answer, ground_truth)` 少一个 `generated_answer` 参数——本项目不做生成式回答，没有"生成内容"这个评测对象），为未来接入其他检索类评估指标留出扩展空间，但默认实现只需覆盖自定义检索指标。评估模块设计为**组合模式**，可同时挂载多个 Evaluator 并行执行、汇总结果——当前仅挂载自定义检索指标一项，但接口层面已支持未来追加其他评估维度而无需改动调用方代码。
 
 **配置驱动示例**（`config/settings.yaml` 关键字段，与通用文档 RAG 结构一致，字段内容按本项目调整）：
 
@@ -248,11 +418,22 @@ embedding:
 vector_store:
   backend: chroma
 retrieval:
+  sparse_backend: bm25
   fusion_algorithm: rrf
   rerank_backend: none  # none | cross_encoder | llm
 evaluation:
   backends: [custom_metrics]  # 不含 ragas，理由见 docs/DECISIONS.md
+dashboard:
+  enabled: true
+  port: TODO  # 待解锁任务，见 §8 末尾
+  traces_dir: ./logs
 ```
+
+**切换流程**：
+
+1. 修改 `settings.yaml` 中对应组件的 `backend`/`provider` 字段。
+2. 确保新后端的依赖已安装、凭据已配置。
+3. 重启服务，工厂函数自动加载新实现，无需修改业务代码。
 
 ### 4.5 可观测性与可视化管理平台
 
@@ -295,12 +476,36 @@ evaluation:
 
 **技术方案**：结构化日志（JSON Lines，`logs/traces.jsonl`）+ 本地 Streamlit Dashboard，与通用文档 RAG 一致——零外部依赖、单用户单机场景不需要分布式追踪。
 
+**实现架构**：
+
+```
+检索/摄取 Pipeline
+    │
+    ▼
+Trace Collector（TraceContext 显式调用）
+    │
+    ▼
+JSON Lines 日志文件（logs/traces.jsonl）
+    │
+    ▼
+本地 Web Dashboard（Streamlit）
+    │
+    ▼
+按 trace_id 查看各阶段详情与性能指标
+```
+
 **`TraceContext` 机制**（与通用文档 RAG 完全一致，直接复用，因为这是纯工程范式，不涉及业务差异）：
 
 1. **创建**：Pipeline/检索入口处创建 `TraceContext` 实例，生成唯一 `trace_id`，记录基础信息。
-2. **阶段记录**：`TraceContext.record_stage(stage_name: str, method: str, details: dict, latency_ms: float)`——各阶段执行完毕后调用，`stage_name` 是固定的通用大类（如 `retrieval`/`rerank`），`method` 记录具体实现（如 `bm25`/`cross_encoder`），`details` 记录该方法相关的细节数据。这样无论底层可插拔组件怎么替换，`stage_name` 结构保持稳定，Dashboard 展示逻辑无需调整。
+2. **阶段记录**：`TraceContext.record_stage(stage_name: str, method: str, details: dict, latency_ms: float)`——各阶段执行完毕后调用，记录该阶段的具体实现与细节数据（划分原则见下）。
 3. **结束**：调用 `TraceContext.finish()`，序列化为 JSON，追加写入 `traces.jsonl`。
 4. **调用约定**：显式调用模式——不强制、不会因未调用而报错，但依赖各可插拔组件的实现者在核心逻辑执行后主动调用 `record_stage()`。好处是代码透明，代价是需要开发者自觉遵守约定（与通用文档 RAG 的取舍一致）。
+
+**阶段划分原则**：
+
+- **Stage 是固定的通用大类**：`query_processing`/`dense`/`sparse`/`fusion`/`rerank`/`load`/`transform`/`embed`/`upsert`，不随具体可插拔实现变化。
+- **具体实现是阶段内部的细节**：`record_stage()` 中通过 `method` 字段记录采用的具体方法（如 `bm25`、`cross_encoder`），通过 `details` 字段记录方法相关的细节数据。
+- 这样无论底层可插拔组件怎么替换（换 Reranker、换 Embedding Provider），阶段结构保持稳定，Dashboard 展示逻辑无需调整——这是「阶段划分」与「组件实现」解耦的具体机制，对应 §4.4 可插拔架构的设计原则在可观测性层面的延伸。
 
 **Dashboard 页面设计**：七页面，相对通用文档 RAG 的六页面做了三处调整——移除"评估后端选择 Ragas/Custom"（本项目评估只有 custom_metrics）、移除 Splitter 相关配置展示（不适用）、新增"待审核队列"页承载 review-gate 流程。
 
@@ -315,6 +520,29 @@ evaluation:
 | 7. Query 追踪 | 查询历史、Dense/Sparse 对比、Rerank 前后排名变化、Fallback 触发记录 | 新增 Fallback 触发的显式展示 |
 
 **Dashboard 与 Trace 的数据关系**：页面 6/7 读取 `traces.jsonl`；页面 1/2/3 直接读取存储层；页面 4/5 直接读取 `review_queue`/反馈记录表，不依赖 Trace。所有页面基于 Trace 中 `method`/`provider` 字段动态渲染，更换可插拔组件后自动适配，无需改 Dashboard 代码。
+
+**配置示例**：
+
+```yaml
+observability:
+  enabled: true
+
+  # 日志配置
+  logging:
+    log_file: logs/traces.jsonl  # JSON Lines 格式日志文件
+    log_level: INFO  # DEBUG | INFO | WARNING
+
+  # 追踪粒度控制
+  detail_level: standard  # minimal | standard | verbose
+
+# Dashboard 管理平台配置（见 §4.4 配置示例的 dashboard 字段）
+dashboard:
+  enabled: true
+  port: TODO  # 待解锁任务，见 §8 末尾
+  traces_dir: ./logs
+  auto_refresh: true       # 是否自动刷新（轮询新 trace）
+  refresh_interval: 5      # 自动刷新间隔（秒）
+```
 
 **Dashboard 技术架构**（目录结构与通用文档 RAG 一致，页面文件按本项目七页面调整）：
 
@@ -335,5 +563,109 @@ src/observability/dashboard/
     ├── review_service.py         # review_queue 读写服务（本项目新增，通用文档 RAG 无对应）
     └── config_service.py         # 配置读取服务（封装 Settings 读取与展示）
 ```
+
+---
+
+### 4.6 多模态图片处理
+
+**目标：** 设计一套完整的图片处理方案，使检索系统能够理解、结构化并索引图片中的题目内容，实现"拍照录题"能力，同时保持架构的简洁性与可扩展性。
+
+**设计理念与策略选型**：
+
+多模态处理的核心挑战在于：**如何让纯文本的检索系统"看懂"图片**。业界主要有两种技术路线：
+
+| 策略 | 核心思路 | 优势 | 劣势 |
+|-----|---------|------|------|
+| **Image-to-Text（图转文）** | 利用 Vision LLM 将图片转化为结构化文本，复用纯文本检索链路 | 架构统一、实现简单、成本可控 | 识别质量依赖 LLM 能力，可能丢失视觉细节 |
+| **Multi-Embedding（多模态向量）** | 使用 CLIP 等模型将图文统一映射到同一向量空间 | 保留原始视觉特征，支持"图搜图" | 需引入额外向量库，架构复杂度高 |
+
+**本项目选型：Image-to-Text（图转文）策略**，即 §4.1 `ImageLoader` 已经采用的路径。选型理由：
+- **业务场景不需要"图搜图"**：本项目的检索目标是"错因相同的题"，不是"长得像的图"——学生不会有"找一道和这张图相似的题"这类需求，Multi-Embedding 解决的核心问题在本项目里不存在真实需求，不构成技术上的取舍空间。
+- **架构统一**：无需引入 CLIP 等多模态 Embedding 模型，无需维护独立的图像向量库，完全复用现有的文本检索链路（Ingestion → Hybrid Search → Rerank）。
+- **语义对齐**：Vision LLM 把图片中的题目转化为结构化文本后，天然可以复用 §4.2 的标准步骤匹配、错因标签匹配等结构化检索能力。
+- **成本可控**：仅在数据摄取阶段一次性调用 Vision LLM，检索阶段无额外成本。
+
+**图片处理全流程设计**（比通用文档 RAG 少一环——没有 Splitter，见 §4.1"不做 Chunking"）：
+
+```
+原始输入（学生拍照 / 老师批量扫描）
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  Loader 阶段：图片识别与 image_id 生成                      │
+│  - ImageLoader 调用 Vision LLM 识别图片中的题目边界与内容    │
+│  - 为每张图片生成唯一标识 image_id                          │
+│  - 输出：List[Question]（见 §4.1，每道题携带 image_ref）    │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  Transform 阶段：结构化识别与质量判定                        │
+│  - Vision LLM 分类型识别（题面文字 / 几何图形结构）           │
+│  - 识别置信度判定，低于阈值标记 recognition_confidence       │
+│  - 输出：结构清洗后的 Question（见 §4.1 Transform 阶段）      │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  Embedding 阶段：与普通题目一致                              │
+│  - 结构化后的题面文本走 §4.1 标准双路编码流程                 │
+│  - 图片本身不参与向量化，只有转换后的文本参与                  │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  Storage 阶段：双轨存储                                     │
+│  - 向量库：存储结构化后的题目文本，用于检索                    │
+│  - 图片索引（image_index.db，见 §4.1）：存储原始图片文件路径，  │
+│    用于检索命中后返回图形给辅导讲师 Agent                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+**各阶段技术要点**：
+
+**1. Loader 阶段：image_id 生成与识别边界**
+
+- `image_id` 生成规则：`{content_hash}_{sequence}`（`content_hash` 为图片内容哈希，`sequence` 为同一输入中的题目序号）——与 §4.1 幂等性设计一致，同一图片重复上传产生相同 `image_id`。
+- 识别边界与 §4.1"多题目边界识别机制"共用同一套 `source_position` 定位逻辑，不重复设计。
+
+**2. Transform 阶段：Vision LLM 选型与分类型识别**
+
+- **Vision LLM 选型策略**：不采用参考项目"国内+国外双模型、按部署环境切换"的地域二分方案——本项目单机构本地部署，不存在合规/地域驱动的切换需求。改为按**任务类型**拆分可插拔维度：文字 OCR（题目文字、手写体）与数学符号/几何图形结构理解分别对应不同的模型能力要求，具体启用哪些模型、路由规则如何设计，为待解锁任务（见 §8 末尾），需要真实题目样本测试后才能拍板。完整选型分析见 `docs/DECISIONS.md`「Vision LLM 选型策略」。
+- **分类型识别（对应通用文档 RAG 的"分类型 Prompt 处理"，本项目按题目结构拆分）**：
+  - **题面文字**：识别重点是文字准确率，尤其手写体与扫描件模糊字迹。
+  - **几何图形结构**：识别重点是图形元素间的关系（全等对应边、角度标注、辅助线），这是本项目区别于通用文档 RAG 图表理解的核心难点——错误的图形结构理解可能导致题目被关联到错误的标准步骤。
+- **幂等与增量处理**：为每张图片的识别结果计算内容哈希，若图片内容未变且 Prompt/模型版本一致，直接复用已有识别结果，避免重复调用 Vision LLM（与 §4.1 Embedding 差量计算的设计理念一致）。
+- **大尺寸图片压缩**：学生拍照场景常见超大尺寸图片，传入 Vision LLM 前按比例压缩（保持宽高比，限制最大边长），控制 API 调用成本与延迟。
+
+**3. Storage 阶段：双轨存储**
+
+- 与 §4.1 Upsert 阶段一致：向量库存储结构化后的题目文本（用于检索），`image_index.db`（见 §4.1 SQLite 统一说明）存储原始图片文件路径（用于命中后返回图形）。
+
+**检索与返回流程**：
+
+当检索命中包含图形的题目（几何题）时，系统需要将图形与文本一并返回：
+
+```
+辅导讲师 Agent 调用 search_questions
+    │
+    ▼
+Hybrid Search 命中题目（question.image_ref 非空）
+    │
+    ▼
+查询 image_index.db，获取图片文件路径
+    │
+    ▼
+读取图片文件，编码为 Base64
+    │
+    ▼
+构造 MCP 响应，包含 TextContent + ImageContent（见 §4.3 返回内容设计）
+```
+
+**质量保障与边界处理**：
+
+- **识别质量检测**：对识别结果进行基础质量检查（题面是否完整、是否包含关键数值/图形描述）。若识别置信度过低或 Vision LLM 返回"无法识别"，标记 `recognition_confidence` 低于阈值，进入 §4.1 描述的 `review_status="pending"` 待审核流程，不静默丢弃（见 §4.1 多题目边界识别机制）。
+- **批量处理优化**：图片识别支持批量异步调用，提高老师批量扫描场景的吞吐量。单张图片识别失败不阻塞同批次其他图片的处理（与 §4.1 Transform 阶段的原子化设计一致）。
+- **降级策略（Vision LLM 不可用时）**：当 Vision LLM 服务不可用或调用失败时，系统不阻塞整个摄取流程——该图片对应的 `Question` 记录以 `metadata.transform_failed=true`、`review_status="pending"` 的形式入库（复用 §4.1 Transform 阶段已有的失败处理机制），`stem` 字段留空或标记"待人工补充"，由老师在待审核队列页手动补全题面后再审核通过。这确保 Vision LLM 的可用性问题不会导致学生拍照录题这一核心入口完全失效。
 
 ---
