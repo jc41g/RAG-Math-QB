@@ -205,4 +205,31 @@ evaluation:
   backends: [custom_metrics]  # 不含 ragas，理由见 docs/DECISIONS.md
 ```
 
+### 4.5 可观测性与可视化管理平台
+
+**目标：** 针对检索系统常见的"黑盒"问题，设计全链路追踪体系与可视化管理平台，覆盖 Ingestion（摄取）与 Query（检索）两条链路，同时承载 review-gate 审核这一本项目特有的核心人工流程。
+
+设计理念（与通用文档 RAG 一致，不做改动）：双链路追踪、透明可回溯、低侵入性（`TraceContext` 显式调用）、轻量本地化（结构化日志 + Streamlit Dashboard，零外部依赖）、动态组件感知（Dashboard 基于 Trace 的 `method`/`provider` 字段动态渲染，换组件不用改 Dashboard 代码）。
+
+**追踪数据结构（相对通用文档 RAG 的调整）**：
+
+- **Query Trace**：阶段沿用 query_processing → dense → sparse → fusion → rerank，与 §4.2 一致。去掉 `answer_faithfulness`（依赖生成环节，本项目不做生成回答）；保留候选相关性类信号，但计算对象是"题目与结构化错因条件的匹配度"而非"文档与自由文本查询的相关性"。Rerank 阶段必须记录 `used_fallback`/`fallback_reason` 字段（§4.2 已定的硬要求，通用文档 RAG 没有这个字段）。
+- **Ingestion Trace**：阶段为 load → transform（仅图片场景，Vision LLM 感知转换）→ embed → upsert，**不含 split 阶段**（本项目不做 Chunking，见 §4.1）。记录识别出的题目数、跳过数（review-gate 判定重复/已存在）、失败数。
+
+**技术方案**：结构化日志（JSON Lines，`logs/traces.jsonl`）+ 本地 Streamlit Dashboard，与通用文档 RAG 一致——零外部依赖、单用户单机场景不需要分布式追踪。`TraceContext` 机制（`record_stage()` + `finish()`）直接复用。
+
+**Dashboard 页面设计**：七页面，相对通用文档 RAG 的六页面做了三处调整——移除"评估后端选择 Ragas/Custom"（本项目评估只有 custom_metrics）、移除 Splitter 相关配置展示（不适用）、新增"待审核队列"页承载 review-gate 流程。
+
+| 页面 | 核心功能 | 与通用文档 RAG 的差异 |
+|---|---|---|
+| 1. 系统总览 | 组件配置卡片、数据资产统计（题目数/章节分布）、最近 Trace 时间 | 组件卡片不展示 Splitter 配置 |
+| 2. 题库浏览器 | 浏览已入库题目（题面/答案/关联标准步骤/难度），按章节/难度筛选 | 对应通用文档 RAG 的"数据浏览器"，浏览对象从文档 Chunk 换成完整题目（无 Chunk 概念） |
+| 3. 数据摄取管理 | 触发三种 Loader（PDF/图片/手动表单）摄取，进度条，文档删除 | 摄取入口从单一文件上传扩展为三种来源 |
+| 4. 待审核队列 | Tab A：`review_queue` 待审提议（标准步骤/错因标签/题目路径映射），approve/reject/edit；Tab B：已批准的 taxonomy（标准步骤库/错因库）只读浏览，供审核时对照 | **本项目新增**，通用文档 RAG 无对应页面（无人工审核流程） |
+| 5. 评估面板 | Tab A：`submit_recommendation_feedback` 收集的反馈汇总；Tab B：运行自定义检索指标（Hit Rate/MRR）、历史趋势 | 去除 Ragas 选项；新增反馈汇总 Tab；当前功能较薄，排序权重仍是待解锁任务 |
+| 6. Ingestion 追踪 | 摄取历史、阶段耗时瀑布图、失败详情 | 阶段列表随 §4.1 调整（无 split） |
+| 7. Query 追踪 | 查询历史、Dense/Sparse 对比、Rerank 前后排名变化、Fallback 触发记录 | 新增 Fallback 触发的显式展示 |
+
+**Dashboard 与 Trace 的数据关系**：页面 6/7 读取 `traces.jsonl`；页面 1/2/3 直接读取存储层；页面 4/5 直接读取 `review_queue`/反馈记录表，不依赖 Trace。所有页面基于 Trace 中 `method`/`provider` 字段动态渲染，更换可插拔组件后自动适配，无需改 Dashboard 代码。
+
 ---
