@@ -669,3 +669,180 @@ Hybrid Search 命中题目（question.image_ref 非空）
 - **降级策略（Vision LLM 不可用时）**：当 Vision LLM 服务不可用或调用失败时，系统不阻塞整个摄取流程——该图片对应的 `Question` 记录以 `metadata.transform_failed=true`、`review_status="pending"` 的形式入库（复用 §4.1 Transform 阶段已有的失败处理机制），`stem` 字段留空或标记"待人工补充"，由老师在待审核队列页手动补全题面后再审核通过。这确保 Vision LLM 的可用性问题不会导致学生拍照录题这一核心入口完全失效。
 
 ---
+
+## 5. 测试方案
+
+### 5.1 设计理念：测试驱动开发（TDD）
+
+本项目采用**测试驱动开发（Test-Driven Development）**作为核心开发范式，确保每个组件在实现前就已明确其预期行为，通过自动化测试持续验证系统质量。
+
+**核心原则**：
+- **早测试、常测试**：每个功能模块实现的同时就编写对应的单元测试，而非事后补测。
+- **测试即文档**：测试用例本身就是最准确的行为规范，新加入的开发者可通过阅读测试快速理解各模块功能——对本项目而言尤其重要，因为 Review-Gate、多路径匹配这类业务规则单靠代码不容易一眼看出边界条件。
+- **快速反馈循环**：单元测试应在秒级完成，支持开发者高频执行，立即发现引入的问题。
+- **分层测试金字塔**：大量快速的单元测试作为基座，少量关键路径的集成测试作为保障，极少数端到端测试验证完整流程。
+
+```
+        /\
+       /E2E\         <- 少量，验证关键业务流程
+      /------\
+     /Integration\   <- 中量，验证模块协作
+    /------------\
+   /  Unit Tests  \  <- 大量，验证单个函数/类
+  /________________\
+```
+
+### 5.2 测试分层策略
+
+#### 5.2.1 单元测试（Unit Tests）
+
+**目标**：验证每个独立组件的内部逻辑正确性，隔离外部依赖。
+
+**覆盖范围**：
+
+| 模块 | 测试重点 | 典型测试用例 |
+|-----|---------|------------|
+| **Loader（PdfLoader/ImageLoader/ManualEntryLoader）** | 多题目边界识别、`Question` 对象产出、置信度标记 | - 测试单页/多页 PDF 中多道题目的边界切分<br>- 验证 `ImageLoader` 对低置信度识别结果标记 `recognition_confidence` 而非丢弃<br>- 检查 `source_position` 字段（`page`/`sequence`）正确性 |
+| **Transform（结构清洗 + Vision LLM 感知转换）** | 题面去噪、语义元数据注入、幂等性 | - 验证规则去噪不破坏合法题面内容<br>- Mock Vision LLM，验证 `topic_tags` 注入逻辑<br>- 验证 Vision LLM 不可用时的降级路径（`transform_failed=true`，见 §4.6）<br>- 验证幂等性（重复处理相同内容哈希不重复调用） |
+| **Embedding（双路向量化）** | 差量计算、批处理、Dense/Sparse 双路生成 | - 验证相同题面生成相同向量<br>- 测试批量请求的拆分与合并（`batch_size` 驱动）<br>- 检查内容哈希缓存命中逻辑，避免重复计费 |
+| **BM25（稀疏编码）** | 关键词提取、权重计算 | - 验证中文分词与停用词过滤<br>- 测试 IDF 计算准确性<br>- 检查稀疏向量格式 |
+| **Retrieval（检索器）** | 结构化过滤、召回精度、融合算法、多路径加分 | - 测试 `reference_stem` 存在/缺失两种场景下的 Dense Route 执行/跳过<br>- 验证 RRF 融合分数计算<br>- 验证单路降级场景（Dense 缺失时直接使用 Sparse 排名，不套 RRF 公式，见 §4.2）<br>- 验证多路径命中加分幅度受控（不压过标准步骤/错因匹配等主信号权重，见 `docs/DECISIONS.md`「检索排序：多路径命中加分机制」） |
+| **Reranker（重排器）** | 分数归一化、Fallback 回退 | - Mock Cross-Encoder，验证分数重排<br>- 测试超时后的 Fallback 逻辑，且返回结果显式标记 `used_fallback`/`fallback_reason`（见 §4.2，不允许静默降级）<br>- 验证空候选集处理 |
+| **Review-Gate 过滤** | 待审内容不可见性 | - 验证 `review_status="pending"` 的题目/标准步骤/错因标签不出现在任何检索结果中<br>- 验证审核通过后立即可被检索命中，不需要重建索引 |
+
+**技术选型**：
+- **测试框架**：`pytest`（Python 标准选择，支持参数化测试、Fixture 机制）
+- **Mock 工具**：`unittest.mock` / `pytest-mock`（隔离外部依赖，如 Vision LLM、Embedding API）
+- **断言增强**：`pytest-check`（支持多断言不中断执行）
+
+#### 5.2.2 集成测试（Integration Tests）
+
+**目标**：验证多个组件协作时的数据流转与接口兼容性。
+
+**覆盖范围**：
+
+| 测试场景 | 验证要点 | 测试策略 |
+|---------|---------|---------|
+| **Ingestion Pipeline** | Loader → Transform → Embedding → Upsert 的完整流程（无 Splitter 环节） | - 使用真实的测试 PDF 题库文件与题目图片<br>- 验证最终存入向量库的 `QuestionRecord` 数据完整性<br>- 检查 `ingestion_records`/`ingestion_history` 记录是否正确写入 |
+| **Hybrid Search** | Dense + Sparse 召回的融合结果，含 `reference_stem` 有无两种路径 | - 准备已知标准步骤的题目样本<br>- 验证 `reference_stem` 提供时融合后的 Top-1 是否命中语义相近题目<br>- 验证 `reference_stem` 缺失时降级为纯结构化过滤排序仍能返回合理结果 |
+| **Rerank Pipeline** | 结构化过滤 → 融合 → 精排的组合 | - 验证 `misconception_tag_id` 缺失时的"宽松包含"后置过滤逻辑<br>- 检查 Reranker 是否改变了 Top-1 结果<br>- 测试 Reranker 失败时的 Fallback 触发与标记 |
+| **MCP Server** | 8 个工具（查询/检索/图片感知转换/提议写入/反馈回流五类）的端到端流程 | - 模拟 MCP Client 发送 JSON-RPC 请求<br>- 验证 `search_questions` 返回的 `content`/`structuredContent` 格式符合 §4.3 设计<br>- 验证 `propose_*` 类工具写入后进入 `review_queue` 且 `review_status=pending`<br>- 测试错误处理（如传入不存在的 `canonical_step_id`，见 §4.2"不做模糊匹配或猜测"） |
+
+**技术选型**：
+- **数据隔离**：每个测试使用独立的临时 SQLite 库/向量库（`pytest-tempdir`），覆盖 `ingestion_history.db`/`image_index.db` 等（见 §4.1 SQLite 持久化存储架构统一说明）
+- **异步测试**：`pytest-asyncio`（若 MCP Server 采用异步实现）
+- **契约测试**：定义 `ProcessedQuery`/`RetrievalResult`/`Question` 等核心数据类型的 Schema，确保接口不漂移
+
+#### 5.2.3 端到端测试（End-to-End Tests）
+
+**目标**：模拟真实用户操作，验证完整业务流程的可用性。
+
+**核心场景**：
+
+**场景 1：数据摄取（三种来源）**
+- **测试目标**：验证图片/PDF/手动表单三种录入路径的完整性与正确性
+- **测试步骤**：
+  - 准备测试素材：几何证明题图片（含手写体）、PDF 题库文件、手动表单数据
+  - 分别执行三种 Loader 的摄取流程
+  - 验证摄取结果：检查识别出的题目数量、`metadata` 完整性（`chapter_code`/`difficulty`/`review_status`）、图片关联（`image_ref`）
+  - 验证存储状态：确认向量库、BM25 索引、`ingestion_records` 正确创建
+  - 验证幂等性：重复摄取同一图片/PDF，确保不产生重复题目（`id` 基于内容哈希）
+- **验证要点**：
+  - 多题目边界识别质量（一份输入中多道题目是否被正确拆分，见 §4.1）
+  - `metadata` 字段完整性
+  - Vision LLM 识别结果（含低置信度标记与降级路径，见 §4.6）
+  - 向量与稀疏索引的正确性
+
+**场景 2：召回测试**
+- **测试目标**：验证检索系统在结构化输入下的召回精度与排序质量
+- **测试步骤**：
+  - 基于已摄取的题库，准备一组测试 `ProcessedQuery`（覆盖不同 `canonical_step_id`/`misconception_tag_id`/`reference_stem` 组合）
+  - 执行混合检索（Dense + Sparse + Rerank）
+  - 验证召回结果：检查 Top-K 题目是否命中预期标准步骤
+  - 对比 `reference_stem` 提供 vs 缺失两种场景下的召回质量差异
+  - 验证多路径命中题目是否获得合理加分，且未压过主信号排序
+- **验证要点**：
+  - Hit Rate@K：Top-K 结果命中预期标准步骤的比率是否达标
+  - 排序质量：`score_breakdown` 各分项是否合理（MRR）
+  - 边界情况处理：不存在的 `canonical_step_id`、空结果、`exclude_question_ids` 全量排除后的场景
+  - Review-Gate 边界：待审核题目在任何 `ProcessedQuery` 下都不应出现在结果中
+
+**场景 3：MCP Client 功能测试（模拟辅导讲师 Agent）**
+- **测试目标**：验证 MCP Server 与辅导讲师 Agent 的协议兼容性与功能完整性
+- **测试步骤**：
+  - 启动 MCP Server（Stdio Transport 模式）
+  - 模拟 MCP Client 依次调用五类工具：`lookup_canonical_steps`、`search_questions`、`ingest_question_from_image`、`propose_question_mapping`、`submit_recommendation_feedback`
+  - 验证返回格式：符合 §4.3 协议规范（`content` 数组、`structuredContent` 中的 `score_breakdown`/`why_recommended`）
+  - 测试提议写入类工具只返回简洁确认（成功与否 + 记录 ID），不返回审核状态
+  - 测试多模态返回：含图形的题目响应正确编码为 Base64 ImageContent
+- **验证要点**：
+  - 协议合规性：JSON-RPC 2.0 格式、错误码映射
+  - 工具注册：`tools/list` 返回全部 8 个工具及其 Schema
+  - 响应格式：TextContent 与 ImageContent 的正确组合
+  - 错误处理：无效 `step_ids`、`image_data` 格式错误、Vision LLM 超时等异常场景
+  - Review-Gate 端到端验证：`propose_question_mapping` 写入后，同一题目立即通过 `search_questions` 检索确认仍不可见，审核通过后才可见
+
+**测试工具**：
+- **BDD 框架**：`behave` 或 `pytest-bdd`（以 Gherkin 语法描述场景）
+- **环境准备**：
+  - 临时测试向量库（独立于生产数据）
+  - 预置的标准测试题库集（覆盖几何证明类核心标准步骤与错因标签）
+  - 本地 MCP Server 进程（Stdio Transport）
+
+### 5.3 检索质量评估测试
+
+**目标**：验证已设计的评估体系（见 §4.4 评估框架抽象）是否正确实现，并能有效评估检索排序质量。
+
+**测试要点**：
+
+1. **黄金测试集准备**
+   - 构建标准的"结构化错因输入 → 预期命中题目"测试集（JSON 格式），覆盖不同章节、难度、单路径/多路径题目
+   - 初期人工标注核心标准步骤场景，后期持续积累老师审核中发现的坏 Case
+
+2. **评估框架实现验证**
+   - 验证自定义检索指标（Hit Rate、MRR）的正确实现（不含 Ragas，理由见 `docs/DECISIONS.md`「评估框架选型」）
+   - 确认 `BaseEvaluator.evaluate(query, retrieved_questions, ground_truth)` 接口能输出标准化的指标字典
+   - 测试组合模式：未来追加其他 Evaluator 时能与现有指标并行执行、汇总结果（见 §4.4）
+
+3. **关键指标达标验证**
+   - 检索指标：Hit Rate@K、MRR 具体达标线为待解锁任务（见 §8 末尾）——现阶段没有真实使用数据支撑具体数值，写死属于虚假精确
+   - 定期运行评估，监控指标是否随排序权重调整（多路径加分系数等，见 §4.2）而回归
+
+**说明**：本节重点是验证评估体系的工程实现，而非重新设计评估方法（评估方法的设计见 §4.4 技术选型）。不含生成质量指标（Faithfulness/Answer Relevancy）——本项目不做生成式回答，没有可评测对象。
+
+### 5.4 性能与压力测试（可选）
+
+> **说明**：本项目定位为本地 MCP Server，单机构部署，采用 Stdio Transport 通信方式。性能与压力测试在当前阶段**不是必需的**，此处列出主要用于：
+> 1. **架构完整性**：展示完整的工程化测试体系，体现系统设计的专业性
+> 2. **未来扩展性**：若后续需要支持多机构部署或云端托管，可直接参考此方案
+> 3. **性能基准建立**：通过基础性能测试了解系统瓶颈，为优化提供数据支撑
+
+**可选测试场景**：
+
+| 测试类型 | 验证点 | 工具 | 优先级 |
+|---------|-------|------|-------|
+| **延迟测试** | 单次检索的 P50/P95/P99 延迟 | `pytest-benchmark` | 中（辅导讲师 Agent 实时对话场景对延迟敏感，见 §4.1 Upsert All-in-One 存储策略的设计动机） |
+| **吞吐量测试** | 批量导入场景的并发写入上限 | `locust` | 低（单机构、老师批量导入非高频场景） |
+| **内存泄漏检测** | 长时间运行后的内存占用 | `memory_profiler` | 低（短期运行无影响） |
+| **向量库性能** | 不同题目规模下的查询速度 | 自定义 Benchmark | 中（验证题库规模扩展后的可用性） |
+
+### 5.5 测试工具链与 CI/CD 集成
+
+**本地开发工作流**：
+- **快速验证**：仅运行单元测试，秒级反馈
+- **完整验证**：单元测试 + 集成测试，生成覆盖率报告
+- **质量评估**：定期执行检索质量测试，监控指标变化
+
+**CI/CD Pipeline 设计**（可选）：
+> **说明**：本地项目不强制要求 CI/CD，但配置自动化测试流程有助于代码质量保障与持续集成实践。
+
+- **单元测试阶段**：每次提交自动触发，验证基础功能，生成覆盖率报告
+- **集成测试阶段**：单元测试通过后执行，验证模块协作
+- **质量评估阶段**：PR 触发，运行完整的检索质量测试，发布评估报告
+
+**测试覆盖率目标**：
+- **单元测试**：核心逻辑覆盖率 ≥ 80%
+- **集成测试**：关键路径覆盖率 100%（如 Ingestion、Hybrid Search、Review-Gate）
+- **E2E 测试**：核心用户场景覆盖率 100%（三种摄取来源 + 召回 + MCP Client，至少 3 个关键流程）
+
+---
