@@ -120,7 +120,41 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
 - **触发入口**：学生即时提交（经辅导讲师 Agent 中转、单条）、后台管理员批量导入（多条，附带批次记录），两者复用同一 Pipeline，仅入口不同。
 - **Review-gate 过滤**：新识别出的题目默认 `review_status="pending"`，在老师审核通过前不参与任何检索（对应硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
 
-`Question` 核心字段（详见 §7 数据模型）：`id`、`stem`（题面）、`answer`（可为空，允许后续人工补充）、`metadata`（至少含 `chapter_code`、`subject_code`、`difficulty`、`review_status`）。
+**数据类型分层（对应通用文档 RAG 的 Document → Chunk → ChunkRecord 三层，本项目因不做 Chunking 而简化为两层）**：
+
+- **`Question`**（Loader 的直接产出，识别结果，尚未向量化）：
+  - `id: str`（基于内容哈希生成，确定性 ID，同一题目重复识别产生相同 ID，支撑幂等摄取）
+  - `stem: str`（题面文本）
+  - `answer: Optional[str]`（可为空，允许后续人工补充）
+  - `metadata: Dict[str, Any]`，至少包含：`chapter_code`（必填）、`subject_code`（必填，V1 恒为 `"math"`）、`difficulty`、`review_status`（`"pending"` | `"approved"`）、`source_ref`（指向 `ingestion_records` 的外键，见下）
+  - `image_ref: Optional[str]`（几何题关联的图形文件路径，若题目本身含图形；对应通用文档 RAG 的 `metadata.images`，但本项目里图片是题目本身的一部分而非文档中的插图，因此提升为顶层字段而非塞进 metadata 列表）
+- **`QuestionRecord`**（Embedding 之后、写入向量库前的最终存储记录，对应通用文档 RAG 的 `ChunkRecord`）：
+  - 继承 `Question` 的全部字段
+  - `dense_vector: Optional[List[float]]`
+  - `sparse_vector: Optional[Dict[str, float]]`
+  - 无需 `start_offset`/`end_offset`/`source_ref`（这些字段服务于 Chunk 在原文档中的定位，本项目题目本身就是完整单元，不存在"在更大文档中的位置"这个概念）
+
+**`ingestion_records` 表字段**（与 `questions` 表分离，见 `docs/DECISIONS.md`「来源/摄取元数据独立建表」）：
+
+```sql
+CREATE TABLE ingestion_records (
+    id            TEXT PRIMARY KEY,
+    question_id   TEXT NOT NULL,      -- FK -> questions.id
+    source_type   TEXT NOT NULL CHECK(source_type IN ('image', 'pdf', 'manual')),
+    source_ref    TEXT,               -- 原始文件路径/引用，manual 来源可为空
+    source_hint   TEXT,               -- 'student_realtime' | 'batch_scan'，仅 image 来源使用
+    imported_by   TEXT NOT NULL,      -- 'student' | 'admin'
+    imported_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    batch_id      TEXT                -- 批量导入场景下的批次标识，单条提交为空
+);
+CREATE INDEX idx_question_id ON ingestion_records(question_id);
+CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
+```
+
+**多题目边界识别机制**（`PdfLoader`/`ImageLoader` 从一份输入中识别多道题目时的定位机制，对应通用文档 RAG 的图片占位符+位置信息设计，但服务的目的不同——通用文档 RAG 定位的是"图片在文本流中的位置"，本项目定位的是"每道题在原始输入中的边界"）：
+
+- 每道被识别出的题目，在 `metadata` 中记录 `source_position`：`{"page": int, "sequence": int}`（`page` 为原始文档/图片的页码，无分页场景可省略；`sequence` 为该页内的题目序号，从 0 开始），用于后续排查"这道题识别得对不对"时定位回原始输入。
+- 识别失败或置信度过低的候选，不静默丢弃，而是以 `review_status="pending"` 且 `metadata.recognition_confidence` 低于阈值的形式入库，交由老师在待审核队列页判断是否为有效题目——避免识别错误导致数据永久丢失、无法追溯。
 
 ### 4.2 检索流水线
 
@@ -128,7 +162,14 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
 
 设计要点：
 
-- **Query 输入契约**：`ProcessedQuery` 不做关键词提取/同义词扩展（那是通用文档 RAG 应对自由文本查询的手段，本场景输入已结构化，不适用）。输入至少包含 `canonical_step_id`，可选 `misconception_tag_id`、`chapter_code`、`difficulty`。
+- **Query 输入契约**：`ProcessedQuery` 不做关键词提取/同义词扩展（那是通用文档 RAG 应对自由文本查询的手段，本场景输入已结构化，不适用）。完整字段：
+  - `canonical_step_id: str`（必填）
+  - `misconception_tag_id: Optional[str]`
+  - `chapter_code: Optional[str]`
+  - `difficulty: Optional[int]`
+  - `top_k: int`（默认值为待解锁任务，当前占位 10）
+  - `exclude_question_ids: List[str]`（可选，用于排除学生已经做过的题，默认空列表）
+  - 无 `keywords`/`expanded_terms` 字段——这两个字段服务于自由文本查询的关键词提取/同义词扩展，本场景输入本身已结构化，不需要这一步预处理。
 - **结构化过滤（硬过滤，前置）**：`review_status != approved` 的题目、以及不满足 `chapter_code`/`canonical_step_id` 硬约束的候选，在检索前直接排除，不进入候选集。对应 `docs/DECISIONS.md`「技术选型验证」中确立的"结构化过滤 + 语义排序"分工原则——能用结构化字段精确排除的，不留给语义层判断。
 - **Hybrid Search（粗排召回）**：与通用文档 RAG 设计一致，不做改动——Dense Route（题面 Embedding 相似度，捕捉"标签相同、具体条件不同"的语义差异，几何题的图形构造差异即典型场景）+ Sparse Route（BM25 关键词检索）+ RRF 融合（`Score = 1 / (k + Rank_Dense) + 1 / (k + Rank_Sparse)`，`k` 可配置）。
 - **多路径匹配加分（本项目特有设计）**：候选题目可能关联多条标准步骤路径（`step_sequence`，见 §7 数据模型的多对多关系）。若同一题目的多条路径都命中传入的 `canonical_step_id`，视为该题对这个错误步骤更有代表性，给予小幅加分；命中单条路径的题目不因"存在其他不相关路径"而受影响。**加分幅度必须受控（远小于标准步骤匹配/错因匹配等主信号权重）**，避免"路径数量多"本身压过"是否真正对症"这个核心排序目标——具体加分系数为待解锁任务（见 §8 末尾），当前用小值占位。**路径本身是审核录入阶段的静态数据，本模块只做路径命中判断与加分，不做路径推理**（硬边界，见 `docs/DECISIONS.md`）。
@@ -136,7 +177,14 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
   - 候选集按标准步骤匹配度、错因标签匹配度、题面语义相似度、章节匹配、难度匹配、多路径命中加分共同加权排序，具体权重公式为待解锁任务（见 §8 末尾），当前用等权重占位跑通链路。
   - 可插拔后端：None（直接用 Fusion 排名）/ Cross-Encoder / LLM Rerank，与通用可插拔架构一致（见 §4.4）。
   - **Fallback 语义**：精排后端不可用/超时/失败时，必须回退到 Fusion 阶段排名，返回结果需显式标记是否使用了 Fallback 及原因，不能静默降级（面向可观测性，便于后续排查排序质量问题）。
-- **输出契约**：每条结果需包含 `score`、`score_breakdown`（各排序信号的分项得分，含多路径加分项）、`why_recommended`（简短说明命中原因，供辅导讲师 Agent 或 Dashboard 展示），不允许只返回裸分数——对应"排序质量是核心商业价值"的结论（见 `docs/DECISIONS.md`「技术选型验证」）。
+- **输出契约**：`RetrievalResult` 完整字段（每个检索阶段——Dense/Sparse/Fusion/Rerank——都以此类型作为候选的统一表示，各阶段只更新 `score`/`stage_scores`，不改变类型结构）：
+  - `question_id: str`
+  - `score: float`（当前阶段的综合分数）
+  - `stage_scores: Dict[str, float]`（各阶段独立分数的留痕，如 `{"dense": 0.8, "sparse": 0.6, "fusion": 0.72}`，用于 §4.5 Query Trace 展示"Dense vs Sparse 对比"）
+  - `matched_path_ids: List[str]`（命中的 `step_sequence` 路径 ID 列表，长度 >1 时对应多路径命中加分场景）
+  - `metadata: Dict[str, Any]`（题目的 `chapter_code`/`difficulty` 等，供上游过滤/展示，不需要重新查库）
+
+  最终返回给调用方的结果在 `RetrievalResult` 基础上补充：`score_breakdown`（各排序信号的分项得分，含多路径加分项）、`why_recommended`（简短说明命中原因，供辅导讲师 Agent 或 Dashboard 展示）。不允许只返回裸分数——对应"排序质量是核心商业价值"的结论（见 `docs/DECISIONS.md`「技术选型验证」）。
 
 ### 4.3 MCP 服务设计
 
@@ -150,6 +198,7 @@ AI 从新题目/错例中挖掘出的候选标准步骤、候选错因标签、�
   - 单一确定 Client：不需要像通用文档 RAG 那样为不同 Client（Copilot vs Claude Desktop）设计差异化的降级/适配策略，因为当前唯一的 Client 就是辅导讲师 Agent，其能力边界由本项目团队自行定义。
 - **传输协议**：Stdio（本地子进程通信），与通用文档 RAG 设计一致——无需网络端口/鉴权，数据不经网络，`stdout` 仅输出合法 MCP 消息，日志统一走 `stderr`。
 - **SDK 选型**：优先采用 Python 官方 MCP SDK（`mcp`），复用其 `@server.tool()` 声明式定义方式，不自行实现协议底层细节。
+- **协议版本协商**：跟踪 MCP 最新稳定版本，在 `initialize` 阶段完成 Client/Server 能力协商，确保兼容性，与通用文档 RAG 一致，不做改动。
 - **Tools 设计**：按职责分五类，共八个工具。
 
 | 类别 | 工具名称 | 功能描述 | 典型输入参数 | 输出特点 |
@@ -213,10 +262,45 @@ evaluation:
 
 **追踪数据结构（相对通用文档 RAG 的调整）**：
 
-- **Query Trace**：阶段沿用 query_processing → dense → sparse → fusion → rerank，与 §4.2 一致。去掉 `answer_faithfulness`（依赖生成环节，本项目不做生成回答）；保留候选相关性类信号，但计算对象是"题目与结构化错因条件的匹配度"而非"文档与自由文本查询的相关性"。Rerank 阶段必须记录 `used_fallback`/`fallback_reason` 字段（§4.2 已定的硬要求，通用文档 RAG 没有这个字段）。
-- **Ingestion Trace**：阶段为 load → transform（仅图片场景，Vision LLM 感知转换）→ embed → upsert，**不含 split 阶段**（本项目不做 Chunking，见 §4.1）。记录识别出的题目数、跳过数（review-gate 判定重复/已存在）、失败数。
+**基础信息字段（两类 Trace 共有）**：
 
-**技术方案**：结构化日志（JSON Lines，`logs/traces.jsonl`）+ 本地 Streamlit Dashboard，与通用文档 RAG 一致——零外部依赖、单用户单机场景不需要分布式追踪。`TraceContext` 机制（`record_stage()` + `finish()`）直接复用。
+- `trace_id: str`（请求/摄取唯一标识）
+- `trace_type: Literal["query", "ingestion"]`
+- `timestamp: datetime`
+- `total_latency: float`（端到端总耗时）
+- `error: Optional[str]`（异常信息，若有）
+
+- **Query Trace**：阶段沿用 query_processing → dense → sparse → fusion → rerank，与 §4.2 一致。基础信息额外含 `processed_query: ProcessedQuery`（见 §4.2，取代通用文档 RAG 的 `user_query` 自由文本字段，因为本项目输入已结构化）。各阶段记录内容：
+
+  | 阶段 | 记录内容 |
+  |---|---|
+  | query_processing | 输入的 `ProcessedQuery` 字段值、耗时 |
+  | dense | Top-N 候选 `RetrievalResult` 列表（含 `stage_scores.dense`）、embedding provider、耗时 |
+  | sparse | Top-N 候选 `RetrievalResult` 列表（含 `stage_scores.sparse`）、耗时 |
+  | fusion | 融合后的统一排名（`RetrievalResult` 列表）、algorithm（rrf）、耗时 |
+  | rerank | 重排后最终排名、backend、**`used_fallback: bool`、`fallback_reason: Optional[str]`**（§4.2 硬要求）、耗时 |
+
+  汇总指标：`top_k_results: List[str]`（最终返回的题目 ID 列表）。去掉通用文档 RAG 的 `answer_faithfulness`（依赖生成环节，本项目不做生成回答）；`context_relevance` 类信号改为"题目与结构化错因条件的匹配度"，计算对象是 §4.2 `score_breakdown` 里的各分项。
+
+- **Ingestion Trace**：阶段为 load → transform（仅图片场景，Vision LLM 感知转换）→ embed → upsert，**不含 split 阶段**（本项目不做 Chunking，见 §4.1）。基础信息额外含 `source_ref: str`（对应 `ingestion_records.source_ref`）、`source_type: str`。各阶段记录内容：
+
+  | 阶段 | 记录内容 |
+  |---|---|
+  | load | 识别出的题目数、来源类型（method: pdf_loader / image_loader / manual_entry_loader）、耗时 |
+  | transform | Vision LLM provider、处理的图片数、耗时（仅图片来源场景执行，其余来源跳过此阶段） |
+  | embed | embedding provider、dense + sparse 编码耗时 |
+  | upsert | 存储后端（method: chroma）、upsert 数量、幂等跳过数、耗时 |
+
+  汇总指标：`total_questions: int`、`skipped: int`（review-gate 判定重复/已存在而跳过的数量）、`failed: int`。
+
+**技术方案**：结构化日志（JSON Lines，`logs/traces.jsonl`）+ 本地 Streamlit Dashboard，与通用文档 RAG 一致——零外部依赖、单用户单机场景不需要分布式追踪。
+
+**`TraceContext` 机制**（与通用文档 RAG 完全一致，直接复用，因为这是纯工程范式，不涉及业务差异）：
+
+1. **创建**：Pipeline/检索入口处创建 `TraceContext` 实例，生成唯一 `trace_id`，记录基础信息。
+2. **阶段记录**：`TraceContext.record_stage(stage_name: str, method: str, details: dict, latency_ms: float)`——各阶段执行完毕后调用，`stage_name` 是固定的通用大类（如 `retrieval`/`rerank`），`method` 记录具体实现（如 `bm25`/`cross_encoder`），`details` 记录该方法相关的细节数据。这样无论底层可插拔组件怎么替换，`stage_name` 结构保持稳定，Dashboard 展示逻辑无需调整。
+3. **结束**：调用 `TraceContext.finish()`，序列化为 JSON，追加写入 `traces.jsonl`。
+4. **调用约定**：显式调用模式——不强制、不会因未调用而报错，但依赖各可插拔组件的实现者在核心逻辑执行后主动调用 `record_stage()`。好处是代码透明，代价是需要开发者自觉遵守约定（与通用文档 RAG 的取舍一致）。
 
 **Dashboard 页面设计**：七页面，相对通用文档 RAG 的六页面做了三处调整——移除"评估后端选择 Ragas/Custom"（本项目评估只有 custom_metrics）、移除 Splitter 相关配置展示（不适用）、新增"待审核队列"页承载 review-gate 流程。
 
@@ -231,5 +315,25 @@ evaluation:
 | 7. Query 追踪 | 查询历史、Dense/Sparse 对比、Rerank 前后排名变化、Fallback 触发记录 | 新增 Fallback 触发的显式展示 |
 
 **Dashboard 与 Trace 的数据关系**：页面 6/7 读取 `traces.jsonl`；页面 1/2/3 直接读取存储层；页面 4/5 直接读取 `review_queue`/反馈记录表，不依赖 Trace。所有页面基于 Trace 中 `method`/`provider` 字段动态渲染，更换可插拔组件后自动适配，无需改 Dashboard 代码。
+
+**Dashboard 技术架构**（目录结构与通用文档 RAG 一致，页面文件按本项目七页面调整）：
+
+```
+src/observability/dashboard/
+├── app.py                       # Streamlit 入口，页面导航注册
+├── pages/
+│   ├── overview.py               # 页面 1：系统总览
+│   ├── question_browser.py       # 页面 2：题库浏览器
+│   ├── ingestion_manager.py      # 页面 3：数据摄取管理
+│   ├── review_queue.py           # 页面 4：待审核队列（Tab A 待审提议 / Tab B taxonomy 浏览）
+│   ├── evaluation_panel.py       # 页面 5：评估面板（Tab A 反馈汇总 / Tab B 指标运行）
+│   ├── ingestion_traces.py       # 页面 6：Ingestion 追踪
+│   └── query_traces.py           # 页面 7：Query 追踪
+└── services/
+    ├── trace_service.py          # Trace 数据读取服务（解析 traces.jsonl）
+    ├── data_service.py           # 数据浏览服务（封装 VectorStore 读取）
+    ├── review_service.py         # review_queue 读写服务（本项目新增，通用文档 RAG 无对应）
+    └── config_service.py         # 配置读取服务（封装 Settings 读取与展示）
+```
 
 ---
