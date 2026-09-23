@@ -1224,3 +1224,93 @@ rag-math-qb/
 - **Prompt 模板去掉 `chunk_refinement.txt`**（无 Chunk 概念），新增 `image_recognition.txt`（对应 §4.6 分类型识别 Prompt）。
 
 ---
+
+### 6.3 模块说明
+
+#### 6.3.1 MCP Server 层
+
+| 模块 | 职责 | 关键技术点 |
+|-----|-----|----------|
+| `server.py` | MCP Server 主入口，处理 Stdio Transport 通信 | Python MCP SDK，JSON-RPC 2.0 |
+| `protocol_handler.py` | 协议解析与能力协商 | `initialize`、`tools/list`、`tools/call` |
+| `tools/*` | 对外暴露的七个工具函数实现（五类，见 §4.3） | 装饰器定义，参数校验，响应格式化 |
+
+#### 6.3.2 Core 层
+
+| 模块 | 职责 | 关键技术点 |
+|-----|-----|----------|
+| `settings.py` | 配置加载与校验 | 读取 `config/settings.yaml`，解析为 `Settings`，必填字段校验（fail-fast） |
+| `types.py` | 核心数据类型/契约（全链路复用） | 定义 `Question/QuestionRecord/ProcessedQuery/RetrievalResult`；序列化稳定；作为 ingestion/retrieval/mcp 的数据契约中心 |
+| `pre_filter.py` | 结构化前置过滤 | `review_status=approved`（Review-Gate 硬规则，不可配置/不可跳过）+ `chapter_code`/`canonical_step_id`（普通结构化过滤条件），Hybrid Search 之前执行，缩小候选集 |
+| `hybrid_search.py` | 混合检索编排 | 并行调度 Dense/Sparse 检索，结果转交 Fusion 融合；reference_stem 有/无双模式 |
+| `dense_retriever.py` | 语义向量检索 | 仅 `reference_stem` 存在时执行；Query Embedding + VectorStore 检索，Cosine Similarity |
+| `sparse_retriever.py` | BM25 关键词检索 | `reference_stem` 缺失时退化为纯结构化过滤；倒排索引查询，TF-IDF 打分 |
+| `fusion.py` | 结果融合 | RRF 算法，排名倒数加权；单路降级时直接采用 Sparse 排名 |
+| `post_filter.py` | 结构化后置过滤 | `misconception_tag_id`，missing→宽松包含，Hybrid Search 之后、Rerank 之前执行 |
+| `reranker.py` | 精排重排 | 多路径命中加分（受控幅度）+ `difficulty` 软偏好；CrossEncoder / LLM Rerank / Fallback 回退（必须显式标记 `used_fallback`） |
+| `response_builder.py` | 响应构建 | MCP 响应格式化，`score_breakdown`/`why_recommended` 组装 |
+| `multimodal_assembler.py` | 多模态组装 | Text + Image Base64 编码，MCP 多内容类型 |
+| `trace_context.py` | 追踪上下文 | trace_id 生成，阶段记录，finish 汇总 |
+| `trace_collector.py` | 追踪收集器 | 收集 trace 并触发持久化到 JSON Lines |
+
+#### 6.3.3 Scripts 层（命令行入口）
+
+| 脚本 | 职责 | 关键技术点 |
+|-----|-----|----------|
+| `ingest.py` | 离线批量导入入口 | CLI 参数解析，调用 Ingestion Pipeline，支持 `--chapter`/`--path`/`--force` |
+| `query.py` | 检索测试入口 | CLI 参数解析，调用 HybridSearch + Reranker，支持 `--canonical-step-id`/`--reference-stem`（可选）/`--top-k`/`--verbose` |
+| `evaluate.py` | 评估运行入口 | 加载 golden_test_set，运行评估，输出 metrics |
+| `start_dashboard.py` | Dashboard 启动入口 | Streamlit 应用启动 |
+
+#### 6.3.4 Ingestion Pipeline 层
+
+| 模块 | 职责 | 关键技术点 |
+|-----|-----|----------|
+| `pipeline.py` | Pipeline 流程编排 | Loader→Transform→Embedding→Upsert 四步（无 Splitter）；异常处理，增量更新；支持 `on_progress` 回调；统一使用 `core/types.py` 的数据契约 |
+| `question_manager.py` | 题目生命周期管理 | list/delete/stats 操作；跨 4 个存储（Chroma/BM25/ImageStorage/FileIntegrity）的协调删除；供 Dashboard 与 CLI 调用 |
+| `transform/base_transform.py` | Transform 抽象 | 原子化、幂等；可独立重试；失败降级不阻塞 |
+| `transform/stem_cleaner.py` | 题面规则去噪 | 仅 `PdfLoader`/`ImageLoader` 场景，`ManualEntryLoader` 跳过；不含跨块合并 |
+| `transform/topic_tagger.py` | 语义元数据注入 | 仅 `PdfLoader` 批量场景触发；`topic_tags` 知识点标签规则/LLM 生成 |
+| `transform/image_recognizer.py` | 图片题目识别 | Vision LLM；分类型 Prompt（文字OCR/几何图形结构）；识别失败/低置信度降级 |
+| `embedding/dense_encoder.py` | 稠密向量编码 | 通过 `libs.embedding` 调用具体 provider；批处理 |
+| `embedding/sparse_encoder.py` | 稀疏向量编码 | BM25 编码/统计；批处理 |
+| `embedding/batch_processor.py` | 批处理优化 | `batch_size` 驱动的批量调用，减少网络 RTT |
+| `storage/vector_upserter.py` | 向量存储写入 | 通过 `libs.vector_store` Upsert；幂等；All-in-One 存储，metadata 完整 |
+| `storage/bm25_indexer.py` | BM25 索引构建 | 倒排索引写入，驱动 `sparse_retriever.py` 检索计算；提供 `remove_document()` 供 `question_manager.py` 删除时调用 |
+| `storage/image_storage.py` | 图片文件存储 | 本地文件系统写入，`image_index.db` 索引映射维护 |
+
+#### 6.3.5 Libs 层（可插拔抽象）
+
+| 抽象接口 | 当前默认实现 | 可替换选项 |
+|---------|------------|----------|
+| `LLMClient` | 占位跑通链路用 Ollama/OpenAI 任一均可，正式选型为待解锁任务，见 §8 | Azure OpenAI / OpenAI / Ollama / DeepSeek |
+| `VisionLLMClient`（独立接口，非 `LLMClient` 子选项） | 占位跑通链路用任一可用 Vision LLM，正式选型（按任务类型路由）为待解锁任务，见 §8 | 具体模型对比见 `docs/DECISIONS.md`「Vision LLM 选型策略」 |
+| `EmbeddingClient` | 占位跑通链路用 OpenAI text-embedding-3 或 Ollama 本地模型，正式选型为待解锁任务，见 §8 | OpenAI / BGE / Ollama 本地模型 |
+| `Loader` | PdfLoader / ImageLoader / ManualEntryLoader（三种来源并存，非互相替代） | 未来可扩展新的录入来源 |
+| `FileIntegrity` | SQLite (`data/db/ingestion_history.db`) | Redis（分布式）/ PostgreSQL（企业级） |
+| `VectorStore` | Chroma | Qdrant / Pinecone |
+| `Reranker` | None（Top-K 默认） | Cross-Encoder / LLM Rerank |
+| `Evaluator` | 自定义检索指标（Hit Rate/MRR） | 不含 Ragas，见 `docs/DECISIONS.md`「评估框架选型」 |
+
+#### 6.3.6 Observability 层
+
+| 模块 | 职责 | 关键技术点 |
+|-----|-----|----------|
+| `logger.py` | 结构化日志 | JSON Formatter，JSON Lines 输出 |
+| `review_service.py` | `review_queue` 读写服务 | 本项目新增，通用文档 RAG 无对应；供待审核队列页读写 |
+| （`trace_context.py`/`trace_collector.py`，见 §6.3.2） | 请求级追踪机制 | 物理文件仅存在于 `src/core/trace/`，此处为可观测性层对同一机制的读取/复用视角，非独立文件 |
+| `dashboard/app.py` | Dashboard 入口 | Streamlit 多页面应用，`st.navigation` 页面注册 |
+| `dashboard/pages/overview.py` | 系统总览 | 组件配置卡片，数据资产统计 |
+| `dashboard/pages/question_browser.py` | 题库浏览器 | 题目列表，关联标准步骤/难度，按章节筛选 |
+| `dashboard/pages/ingestion_manager.py` | 数据摄取管理 | 三种来源触发摄取（进度条），题目删除 |
+| `dashboard/pages/review_queue.py` | 待审核队列 | 本项目新增；Tab A 待审提议 approve/reject/edit，Tab B taxonomy 只读浏览 |
+| `dashboard/pages/evaluation_panel.py` | 评估面板 | Tab A 反馈汇总，Tab B 自定义指标运行、历史趋势 |
+| `dashboard/pages/ingestion_traces.py` | Ingestion 追踪 | 摄取历史，阶段耗时瀑布图（无 split 阶段） |
+| `dashboard/pages/query_traces.py` | Query 追踪 | 查询历史，Dense/Sparse 对比，Rerank 变化，Fallback 触发记录 |
+| `dashboard/services/trace_service.py` | Trace 数据服务 | 解析 traces.jsonl，按 trace_type 分类 |
+| `dashboard/services/data_service.py` | 数据浏览服务 | 封装 VectorStore 读取 |
+| `dashboard/services/config_service.py` | 配置读取服务 | 封装 Settings 展示 |
+| `evaluation/eval_runner.py` | 评估执行 | 黄金测试集，指标计算，报告生成 |
+| `evaluation/composite_evaluator.py` | 组合评估器 | 挂载自定义指标，预留未来追加其他 Evaluator 的组合能力 |
+
+---
