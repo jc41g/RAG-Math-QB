@@ -1464,3 +1464,83 @@ Dashboard (Streamlit UI)
 - **6.4.3**：题库浏览管道改经 `data_service.py` 封装的 VectorStore 抽象读取，不直接点名具体实现类；`delete_question()` 按 §4.1 原文改为四步（VectorStore 删除含 dense/sparse、`ingestion_records` 删除、`ingestion_history` 处理记录移除、图片文件删除），`BM25Indexer.remove_document()` 是 VectorStore 删除步骤里 sparse 一侧的具体接口，不是独立并列步骤；新增"待审核队列"管道（本项目独有，对应 Review-Gate 机制）；"Trace 查看"管道复用已有 `trace_service.py` 机制，非新设计。
 
 ---
+
+### 6.5 配置驱动设计
+
+系统通过 `config/settings.yaml` 统一配置各组件实现，支持零代码切换：
+
+```yaml
+# config/settings.yaml 示例
+
+# LLM 配置（占位跑通链路，正式选型为待解锁任务，见 §8）
+llm:
+  provider: TODO             # azure | openai | ollama | deepseek
+  model: TODO
+
+# Embedding 配置（占位跑通链路，正式选型为待解锁任务，见 §8）
+embedding:
+  provider: TODO             # openai | azure | ollama (本地)
+  model: TODO
+
+# Vision LLM 配置（图片题目识别，见 §4.6；独立于 llm，非其子选项）
+vision_llm:
+  provider: TODO             # 按任务类型路由（文字OCR/图形理解），选型为待解锁任务
+  model: TODO
+
+# 向量存储配置
+vector_store:
+  backend: chroma            # chroma | qdrant | pinecone
+  persist_path: ./data/db/chroma
+
+# 检索配置
+retrieval:
+  sparse_backend: bm25
+  fusion_algorithm: rrf       # rrf | weighted_sum
+  top_n: 20                   # Dense/Sparse 各自召回数量，待解锁任务，见 §8（本项目新增字段名，非照搬 §4.2 原文字段）
+  top_k: 10                   # ProcessedQuery.top_k 未传时的全局默认值，待解锁任务，见 §8
+
+# 重排配置（从 §4.4 的 retrieval.rerank_backend 平级字段拆分为独立配置块，聚合 rerank 专属参数）
+rerank:
+  backend: none                # none | cross_encoder | llm
+  model: TODO
+  top_m: 30                    # Cross-Encoder 语境占位值（10~30）；若 backend 切换为 llm，需调整为 ≤20（见 §4.2）
+  multi_path_bonus: 0.05       # 多路径命中加分系数，当前小值占位，正式取值为待解锁任务，见 §8（对应 §4.3 score_breakdown 示例值）
+
+# 评估配置（不含 ragas，理由见 docs/DECISIONS.md「评估框架选型」）
+evaluation:
+  backends: [custom_metrics]
+  golden_test_set: ./tests/fixtures/golden_test_set.json
+
+# 可观测性配置
+observability:
+  enabled: true
+  logging:
+    log_file: logs/traces.jsonl
+    log_level: INFO            # DEBUG | INFO | WARNING
+  detail_level: standard       # minimal | standard | verbose
+
+# Dashboard 管理平台配置
+dashboard:
+  enabled: true
+  port: TODO                   # Streamlit 服务端口，待解锁任务，见 §8
+  traces_dir: ./logs
+  auto_refresh: true
+  refresh_interval: 5
+```
+
+### 6.6 扩展性设计要点
+
+1. **新增 LLM/Vision LLM Provider**：实现 `BaseLLM`/`BaseVisionLLM` 接口，在对应 `*_factory.py` 中注册，配置文件指定 `provider` 即可
+2. **新增录入来源**：实现 `BaseLoader` 接口，在 Pipeline 中注册对应来源类型（`source_type`）的处理器
+3. **新增检索策略**：实现检索接口，在 `hybrid_search.py` 中组合调用（不改变 `pre_filter.py`/`post_filter.py` 的过滤契约）
+4. **新增评估指标**：实现 `BaseEvaluator` 接口，在配置中添加到 `backends` 列表，`composite_evaluator.py` 自动纳入组合执行
+5. **新增学科/章节**：结构化字段（`chapter_code`/`canonical_step_id`）本身学科无关，扩展到新学科无需改动检索/存储逻辑，仅需扩充 taxonomy 数据
+
+---
+
+**与通用文档 RAG 配置结构的关键差异**：
+
+- **6.5**：`chunk_size`/`chunk_overlap`/Splitter 相关字段全部移除（不做 Chunking）；`llm`/`embedding`/`vision_llm`/`dashboard.port` 具体 provider 与参数值统一改为 `TODO` 占位（对应 §4.4/§4.6 已明确"具体选型为待解锁任务"的决策）；`rerank.multi_path_bonus` 按 §4.2 原文要求用具体小值占位（0.05，对应 §4.3 `score_breakdown` 示例）而非留空 TODO，避免链路因非数值字段跑不通；`rerank` 从 §4.4 中 `retrieval.rerank_backend` 平级字段拆分为独立配置块，聚合新增的 `top_m`/`multi_path_bonus` 等 rerank 专属参数；`observability` 补全 §4.5 已确定的三层结构（`logging.log_file`/`log_level` + `detail_level`），不再拍平成单一 `log_file`；`retrieval.top_n`/`top_k` 为本项目新增/沿用字段，非照搬 §4.2 原文字段名，`top_k` 语义上对应 `ProcessedQuery.top_k` 未传时的全局默认值；`evaluation.backends` 去掉 `ragas`。
+- **6.6**：去掉"新增文档格式"（改为"新增录入来源"，按 `source_type` 而非文件扩展名区分）；新增第 5 条"新增学科/章节"（本项目特有的可扩展性维度，对应 `docs/DECISIONS.md`「数据结构可扩展性：不限定学科」）。
+
+---
