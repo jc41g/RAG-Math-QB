@@ -1314,3 +1314,153 @@ rag-math-qb/
 | `evaluation/composite_evaluator.py` | 组合评估器 | 挂载自定义指标，预留未来追加其他 Evaluator 的组合能力 |
 
 ---
+
+### 6.4 数据流说明
+
+#### 6.4.1 离线/实时数据摄取流（Ingestion Flow）
+
+```
+原始输入（PDF 题库 / 图片拍照或扫描 / 手动表单）
+      │
+      ▼
+┌─────────────────┐     未变更则跳过
+│ File Integrity  │───────────────────────────► 结束
+│   (SHA256)      │
+└────────┬────────┘
+         │ 新输入/已变更
+         ▼
+┌─────────────────┐
+│     Loader      │  PdfLoader/ImageLoader/ManualEntryLoader
+│  (三种来源)      │  多题目边界识别 + source_position 定位
+└────────┬────────┘
+         │ List[Question]（含 metadata.recognition_confidence）
+         ▼
+┌─────────────────┐
+│   Transform     │  stem_cleaner（题面去噪）+ topic_tagger（语义标签，
+│                 │  仅 PdfLoader 批量场景）+ image_recognizer（Vision LLM，
+│                 │  仅图片来源；不可用时降级 transform_failed=true）
+└────────┬────────┘
+         │ 清洗后的 Question[]
+         ▼
+┌─────────────────┐
+│   Embedding     │  Dense + Sparse 双路编码（差量计算，batch_processor 批处理）
+│  (Dual Path)    │
+└────────┬────────┘
+         │ QuestionRecord[]（Dense Vector + Sparse Vector + Metadata）
+         ▼
+┌─────────────────┐
+│    Upsert       │  Chroma All-in-One Upsert (幂等) + BM25 Index + 图片存储
+│   (Storage)     │  Batch 事务性写入（原子性保证）
+└─────────────────┘
+```
+
+（无 Splitter 阶段——本项目不做 Chunking，见 §4.1）
+
+#### 6.4.2 在线检索流（Retrieval Flow）
+
+```
+辅导讲师 Agent 调用（via MCP Client）
+      │
+      ▼
+┌─────────────────┐
+│  MCP Server     │  JSON-RPC 解析，工具路由（search_questions）
+│ (Stdio Transport)│
+└────────┬────────┘
+         │ ProcessedQuery（canonical_step_id 必填 + reference_stem 可选）
+         ▼
+┌─────────────────┐
+│   Pre-Filter    │  review_status=approved（硬规则）+ chapter_code/canonical_step_id
+│  (结构化前置)    │
+└────────┬────────┘
+         │ 已过滤候选集
+         ▼
+┌─────────────────────────────────────────────┐
+│              Hybrid Search                  │
+│  ┌─────────────┐          ┌─────────────┐   │
+│  │Dense Retrieval│  并行   │Sparse Retrieval│   │
+│  │仅 reference_ │◄───────►│reference_stem│   │
+│  │stem存在时执行 │          │有:BM25/无:结构化│   │
+│  └──────┬──────┘          └──────┬──────┘   │
+│         │                        │          │
+│         └────────┬───────────────┘          │
+│                  ▼                          │
+│         ┌─────────────┐                     │
+│         │   Fusion    │  RRF 融合；单路降级时  │
+│         │   (RRF)     │  直接用 Sparse 排名   │
+│         └──────┬──────┘                     │
+└────────────────┼────────────────────────────┘
+                 │ Top-N 候选
+                 ▼
+┌─────────────────┐
+│  Post-Filter    │  misconception_tag_id（missing→宽松包含）
+│  (结构化后置)    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│    Reranker     │  多路径命中加分 + difficulty 软偏好；CrossEncoder / LLM / None；
+│   (Optional)    │  Fallback `used_fallback`/`fallback_reason` 显式标记
+└────────┬────────┘
+         │ Top-K 精排结果（score_breakdown）
+         ▼
+┌─────────────────┐
+│ Response Builder│  why_recommended 组装 + 图片 Base64 编码 + MCP 格式化
+│                 │
+└────────┬────────┘
+         │ MCP Response (TextContent + ImageContent)
+         ▼
+返回给辅导讲师 Agent
+```
+
+（无 Query Processor 阶段——本项目输入已结构化，见 §4.2；每个阶段各自调用 `TraceContext.record_stage()`，见 §4.5）
+
+#### 6.4.3 管理操作流（Management Flow）
+
+```
+Dashboard (Streamlit UI)
+      │
+      ├─── 题库浏览 ──────────────────────────────────────────┐
+      │                                                       │
+      │    data_service.py（封装 VectorStore 抽象读取）         │
+      │    └── 按 chapter_code/question_id 返回题目列表 /      │
+      │        详情 / 图片预览                                 │
+      │                                                       │
+      ├─── 数据摄取管理 ──────────────────────────────────────┤
+      │                                                       │
+      │    触发摄取：                                          │
+      │    ├── IngestionPipeline.run(source, source_type,     │
+      │    │                         on_progress=callback)    │
+      │    └── st.progress() 实时更新进度                      │
+      │                                                       │
+      │    删除题目：                                          │
+      │    ├── QuestionManager.delete_question(question_id)   │
+      │    │   ├── VectorStore.delete_by_id(question_id)      │
+      │    │   │   （sparse 侧经 BM25Indexer.remove_document） │
+      │    │   ├── ingestion_records 删除对应摄取记录           │
+      │    │   ├── ingestion_history（若为唯一产出）→          │
+      │    │   │   FileIntegrity.remove_record(input_hash)    │
+      │    │   └── ImageStorage 删除关联图片文件（若有）        │
+      │    └── 刷新题目列表                                    │
+      │                                                       │
+      ├─── 待审核队列 ────────────────────────────────────────┤
+      │                                                       │
+      │    ReviewService                                       │
+      │    ├── Tab A：读取 review_queue，approve/reject/edit   │
+      │    │   → approve 后 review_status 更新，检索立即可见    │
+      │    └── Tab B：只读浏览已批准 taxonomy（标准步骤/错因库） │
+      │                                                       │
+      └─── Trace 查看（复用 trace_service.py，非新设计）───────┘
+           │
+           TraceService
+           ├── 读取 logs/traces.jsonl
+           ├── 按 trace_type 分类 (query / ingestion)
+           └── 返回 Trace 列表与详情
+```
+
+**与通用文档 RAG 数据流的关键差异**：
+
+- **6.4.1**：Loader 从单一 PDF 换成三种来源并列，去掉 Splitter 阶段，Transform 阶段的三个动作对应 §4.1/§4.6 的实际触发条件。
+- **6.4.2**：去掉 Query Processor（输入已结构化），新增 Pre-Filter/Post-Filter 两个显式阶段（对应 §4.2 Multi-stage Filtering），Dense/Sparse 双路标注了 `reference_stem` 条件分支，Fusion 标注单路降级逻辑，Rerank 标注多路径加分与 Fallback 强制显式标记（`used_fallback`/`fallback_reason`）；每个阶段各自调用 `TraceContext.record_stage()`，非流程末尾统一记录。
+- **6.4.3**：题库浏览管道改经 `data_service.py` 封装的 VectorStore 抽象读取，不直接点名具体实现类；`delete_question()` 按 §4.1 原文改为四步（VectorStore 删除含 dense/sparse、`ingestion_records` 删除、`ingestion_history` 处理记录移除、图片文件删除），`BM25Indexer.remove_document()` 是 VectorStore 删除步骤里 sparse 一侧的具体接口，不是独立并列步骤；新增"待审核队列"管道（本项目独有，对应 Review-Gate 机制）；"Trace 查看"管道复用已有 `trace_service.py` 机制，非新设计。
+
+---
