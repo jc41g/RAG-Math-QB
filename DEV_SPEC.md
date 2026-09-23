@@ -337,7 +337,7 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 - **SDK 选型**：优先采用 Python 官方 MCP SDK（`mcp`），复用其 `@server.tool()` 声明式定义方式，不自行实现协议底层细节。
 - **SDK 备选方案**：若未来需要深度定制 HTTP 行为（自定义中间件、复杂鉴权流程）或出现独立于辅导讲师 Agent 的第二调用方（触发 REST API 的场景，见 `docs/DECISIONS.md`「对外接口形态」），可考虑 FastAPI + 自定义协议层；权衡是开发成本更高，需自行实现能力协商（Capability Negotiation）、错误码映射，且需持续跟进协议版本更新。本阶段无此需求，官方 SDK 已充分满足。
 - **协议版本协商**：跟踪 MCP 最新稳定版本，在 `initialize` 阶段完成 Client/Server 能力协商，确保兼容性，与通用文档 RAG 一致，不做改动。
-- **Tools 设计**：Server 通过 `tools/list` 向辅导讲师 Agent 注册可调用的工具函数，设计遵循"单一职责、参数明确、输出丰富"原则——每个工具只做一件事（查询/检索/转换/提议/反馈五类不混合），参数语义清晰不复用，返回值携带足够信息支撑调用方决策（如 `score_breakdown`），不要求调用方二次查询补全上下文。按职责分五类，共八个工具。
+- **Tools 设计**：Server 通过 `tools/list` 向辅导讲师 Agent 注册可调用的工具函数，设计遵循"单一职责、参数明确、输出丰富"原则——每个工具只做一件事（查询/检索/转换/提议/反馈五类不混合），参数语义清晰不复用，返回值携带足够信息支撑调用方决策（如 `score_breakdown`），不要求调用方二次查询补全上下文。按职责分五类，共七个工具。
 
 | 类别 | 工具名称 | 功能描述 | 典型输入参数 | 输出特点 |
 |---|---|---|---|---|
@@ -726,7 +726,7 @@ Hybrid Search 命中题目（question.image_ref 非空）
 | **Ingestion Pipeline** | Loader → Transform → Embedding → Upsert 的完整流程（无 Splitter 环节） | - 使用真实的测试 PDF 题库文件与题目图片<br>- 验证最终存入向量库的 `QuestionRecord` 数据完整性<br>- 检查 `ingestion_records`/`ingestion_history` 记录是否正确写入 |
 | **Hybrid Search** | Dense + Sparse 召回的融合结果，含 `reference_stem` 有无两种路径 | - 准备已知标准步骤的题目样本<br>- 验证 `reference_stem` 提供时融合后的 Top-1 是否命中语义相近题目<br>- 验证 `reference_stem` 缺失时降级为纯结构化过滤排序仍能返回合理结果 |
 | **Rerank Pipeline** | 结构化过滤 → 融合 → 精排的组合 | - 验证 `misconception_tag_id` 缺失时的"宽松包含"后置过滤逻辑<br>- 检查 Reranker 是否改变了 Top-1 结果<br>- 测试 Reranker 失败时的 Fallback 触发与标记 |
-| **MCP Server** | 8 个工具（查询/检索/图片感知转换/提议写入/反馈回流五类）的端到端流程 | - 模拟 MCP Client 发送 JSON-RPC 请求<br>- 验证 `search_questions` 返回的 `content`/`structuredContent` 格式符合 §4.3 设计<br>- 验证 `propose_*` 类工具写入后进入 `review_queue` 且 `review_status=pending`<br>- 测试错误处理（如传入不存在的 `canonical_step_id`，见 §4.2"不做模糊匹配或猜测"） |
+| **MCP Server** | 7 个工具（查询/检索/图片感知转换/提议写入/反馈回流五类）的端到端流程 | - 模拟 MCP Client 发送 JSON-RPC 请求<br>- 验证 `search_questions` 返回的 `content`/`structuredContent` 格式符合 §4.3 设计<br>- 验证 `propose_*` 类工具写入后进入 `review_queue` 且 `review_status=pending`<br>- 测试错误处理（如传入不存在的 `canonical_step_id`，见 §4.2"不做模糊匹配或猜测"） |
 
 **技术选型**：
 - **数据隔离**：每个测试使用独立的临时 SQLite 库/向量库（`pytest-tempdir`），覆盖 `ingestion_history.db`/`image_index.db` 等（见 §4.1 SQLite 持久化存储架构统一说明）
@@ -777,7 +777,7 @@ Hybrid Search 命中题目（question.image_ref 非空）
   - 测试多模态返回：含图形的题目响应正确编码为 Base64 ImageContent
 - **验证要点**：
   - 协议合规性：JSON-RPC 2.0 格式、错误码映射
-  - 工具注册：`tools/list` 返回全部 8 个工具及其 Schema
+  - 工具注册：`tools/list` 返回全部 7 个工具及其 Schema
   - 响应格式：TextContent 与 ImageContent 的正确组合
   - 错误处理：无效 `step_ids`、`image_data` 格式错误、Vision LLM 超时等异常场景
   - Review-Gate 端到端验证：`propose_question_mapping` 写入后，同一题目立即通过 `search_questions` 检索确认仍不可见，审核通过后才可见
@@ -997,10 +997,230 @@ Hybrid Search 命中题目（question.image_ref 非空）
 **与通用文档 RAG 架构图的关键差异**：
 
 - MCP Clients 层从多 Client 并列简化为单一确定 Client（辅导讲师 Agent），见 §4.3。
-- MCP Server 层工具固定为 8 个、分五类（查询/检索/图片感知转换/提议写入×3/反馈回流），见 §4.3。
+- MCP Server 层工具固定为 7 个、分五类（查询/检索/图片感知转换/提议写入×3/反馈回流），见 §4.3。
 - Core 层无 Query Processor（输入已结构化，见 §4.2），`ProcessedQuery` 直接进入 Multi-stage Filtering；Dense Route 仅在 `reference_stem` 存在时执行，是本项目独有的降级机制。
 - Storage 层新增 `review_queue`，替代通用文档 RAG 的 Processing Cache（本项目无 Chunk 级处理缓存）。
 - Ingestion Pipeline 无 Splitter 环节，Loader 从单一 PDF 扩展为三种来源。
 - Libs 层无 Splitter Factory；Evaluator Factory 只含自定义指标，不含 Ragas/DeepEval。
+
+---
+
+### 6.2 目录结构
+
+```
+rag-math-qb/
+│
+├── config/                              # 配置文件目录
+│   ├── settings.yaml                    # 主配置文件 (LLM/Vision LLM/Embedding/VectorStore 配置，见 §4.4)
+│   └── prompts/                         # Prompt 模板目录
+│       ├── image_recognition.txt        # 图片题目识别 Prompt（分类型：文字OCR/几何图形结构，见 §4.6）
+│       └── rerank.txt                   # LLM Rerank Prompt
+│
+├── src/                                 # 源代码主目录
+│   │
+│   ├── mcp_server/                      # MCP Server 层 (接口层，见 §4.3)
+│   │   ├── __init__.py
+│   │   ├── server.py                    # MCP Server 入口 (Stdio Transport)
+│   │   ├── protocol_handler.py          # JSON-RPC 协议处理
+│   │   └── tools/                       # MCP Tools 定义，五类共七个工具
+│   │       ├── __init__.py
+│   │       ├── lookup_canonical_steps.py       # 查询：候选标准步骤列表
+│   │       ├── search_questions.py             # 检索：核心检索入口
+│   │       ├── ingest_question_from_image.py   # 图片感知转换：触发 Ingestion Pipeline
+│   │       ├── propose_canonical_step.py       # 提议写入：新标准步骤
+│   │       ├── propose_misconception_tag.py    # 提议写入：新错因标签
+│   │       ├── propose_question_mapping.py     # 提议写入：题目-步骤映射（单步骤/整条路径）
+│   │       └── submit_recommendation_feedback.py  # 反馈回流：推荐结果反馈
+│   │
+│   ├── core/                            # Core 层 (核心业务逻辑)
+│   │   ├── __init__.py
+│   │   ├── settings.py                   # 配置加载与校验 (Settings：load_settings/validate_settings)
+│   │   ├── types.py                      # 核心数据类型/契约（Question/QuestionRecord/ProcessedQuery/RetrievalResult，见 §4.1/§4.2），供 ingestion/retrieval/mcp 复用
+│   │   │
+│   │   ├── retrieval_engine/            # 检索引擎模块（对应通用文档 RAG 的 query_engine，见 §4.2）
+│   │   │   ├── __init__.py
+│   │   │   ├── pre_filter.py            # 结构化前置过滤（review_status/chapter_code/canonical_step_id，Hybrid Search 之前执行，硬边界排除）
+│   │   │   ├── hybrid_search.py         # 混合检索引擎 (Dense + Sparse + RRF，reference_stem 有/无双模式)
+│   │   │   ├── dense_retriever.py       # 稠密向量检索（仅 reference_stem 存在时执行）
+│   │   │   ├── sparse_retriever.py      # 稀疏检索 (BM25，reference_stem 缺失时退化为纯结构化过滤)
+│   │   │   ├── fusion.py                # 结果融合 (RRF 算法，含单路降级逻辑)
+│   │   │   ├── post_filter.py           # 结构化后置过滤（misconception_tag_id，Hybrid Search 之后、Rerank 之前执行，safety net，missing→宽松放行）
+│   │   │   └── reranker.py              # 重排序模块 (None/CrossEncoder/LLM，含多路径命中加分与 Fallback 显式标记)
+│   │   │
+│   │   ├── response/                    # 响应构建模块
+│   │   │   ├── __init__.py
+│   │   │   ├── response_builder.py      # 响应构建器（score_breakdown/why_recommended 组装，见 §4.3）
+│   │   │   └── multimodal_assembler.py  # 多模态内容组装 (Text + Image)
+│   │   │
+│   │   └── trace/                       # 追踪模块
+│   │       ├── __init__.py
+│   │       ├── trace_context.py         # 追踪上下文 (trace_id/stages，创建→record_stage()→finish()，见 §4.5)
+│   │       └── trace_collector.py       # 追踪收集器
+│   │
+│   ├── ingestion/                       # Ingestion Pipeline (离线批量导入 / 实时拍照录题共用，见 §4.1)
+│   │   ├── __init__.py
+│   │   ├── pipeline.py                  # Pipeline 主流程编排 (Loader→Transform→Embedding→Upsert，无 Splitter，支持 on_progress 回调)
+│   │   ├── question_manager.py          # 题目生命周期管理 (list/delete/stats，对应通用文档 RAG 的 document_manager)
+│   │   │
+│   │   ├── transform/                   # Transform 模块 (结构清洗 + 图片感知转换)
+│   │   │   ├── __init__.py
+│   │   │   ├── base_transform.py        # Transform 抽象基类
+│   │   │   ├── stem_cleaner.py          # 题面规则去噪（仅 PdfLoader/ImageLoader 场景，ManualEntryLoader 跳过；对应通用文档 RAG 的 chunk_refiner，不含跨块合并）
+│   │   │   ├── topic_tagger.py          # 语义元数据注入（topic_tags 知识点标签，仅 PdfLoader 批量场景触发，见 §4.1）
+│   │   │   └── image_recognizer.py      # 图片题目识别 (Vision LLM，分类型 Prompt，见 §4.6)
+│   │   │
+│   │   ├── embedding/                   # Embedding 模块 (双路向量化，见 §4.1)
+│   │   │   ├── __init__.py
+│   │   │   ├── dense_encoder.py         # 稠密向量编码
+│   │   │   ├── sparse_encoder.py        # 稀疏向量编码 (BM25)
+│   │   │   └── batch_processor.py       # 批处理优化
+│   │   │
+│   │   └── storage/                     # Storage 模块 (Upsert All-in-One，见 §4.1)
+│   │       ├── __init__.py
+│   │       ├── vector_upserter.py       # 向量库 Upsert（幂等，原子性保证）
+│   │       ├── bm25_indexer.py          # BM25 索引构建
+│   │       └── image_storage.py         # 图片文件存储
+│   │
+│   ├── libs/                            # Libs 层 (可插拔抽象层，见 §4.4)
+│   │   ├── __init__.py
+│   │   │
+│   │   ├── loader/                      # Loader 抽象 (三种来源，见 §4.1)
+│   │   │   ├── __init__.py
+│   │   │   ├── base_loader.py           # Loader 抽象基类
+│   │   │   ├── pdf_loader.py            # PdfLoader（题库文档多题目边界识别）
+│   │   │   ├── image_loader.py          # ImageLoader（学生拍照/老师批量扫描共用）
+│   │   │   ├── manual_entry_loader.py   # ManualEntryLoader（Dashboard 手动录入）
+│   │   │   └── file_integrity.py        # 文件完整性检查 (SHA256 哈希)
+│   │   │
+│   │   ├── llm/                         # LLM 抽象
+│   │   │   ├── __init__.py
+│   │   │   ├── base_llm.py              # LLM 抽象基类
+│   │   │   ├── llm_factory.py           # LLM 工厂
+│   │   │   ├── azure_llm.py             # Azure OpenAI 实现
+│   │   │   ├── openai_llm.py            # OpenAI 实现
+│   │   │   ├── ollama_llm.py            # Ollama 本地模型实现
+│   │   │   └── deepseek_llm.py          # DeepSeek 实现
+│   │   │
+│   │   ├── vision_llm/                  # Vision LLM 抽象（独立接口，非 LLM Factory 子选项，见 §4.4/§4.6）
+│   │   │   ├── __init__.py
+│   │   │   ├── base_vision_llm.py       # BaseVisionLLM 抽象基类
+│   │   │   └── vision_llm_factory.py    # Vision LLM 工厂（按任务类型路由，具体选型为待解锁任务，见 §8）
+│   │   │
+│   │   ├── embedding/                   # Embedding 抽象
+│   │   │   ├── __init__.py
+│   │   │   ├── base_embedding.py        # Embedding 抽象基类
+│   │   │   ├── embedding_factory.py     # Embedding 工厂
+│   │   │   ├── openai_embedding.py      # OpenAI Embedding 实现
+│   │   │   ├── azure_embedding.py       # Azure Embedding 实现
+│   │   │   └── ollama_embedding.py      # Ollama 本地模型实现
+│   │   │
+│   │   ├── vector_store/                # VectorStore 抽象
+│   │   │   ├── __init__.py
+│   │   │   ├── base_vector_store.py     # VectorStore 抽象基类
+│   │   │   ├── vector_store_factory.py  # VectorStore 工厂
+│   │   │   └── chroma_store.py          # Chroma 实现
+│   │   │
+│   │   ├── reranker/                    # Reranker 抽象
+│   │   │   ├── __init__.py
+│   │   │   ├── base_reranker.py         # Reranker 抽象基类
+│   │   │   ├── reranker_factory.py      # Reranker 工厂
+│   │   │   ├── cross_encoder_reranker.py# CrossEncoder 实现
+│   │   │   └── llm_reranker.py          # LLM Rerank 实现
+│   │   │
+│   │   └── evaluator/                   # Evaluator 抽象（不含 Ragas，见 §4.4）
+│   │       ├── __init__.py
+│   │       ├── base_evaluator.py        # Evaluator 抽象基类
+│   │       ├── evaluator_factory.py     # Evaluator 工厂
+│   │       └── custom_evaluator.py      # 自定义检索指标实现 (Hit Rate/MRR)
+│   │
+│   └── observability/                   # Observability 层 (可观测性，见 §4.5)
+│       ├── __init__.py
+│       ├── logger.py                    # 结构化日志 (JSON Formatter)
+│       ├── review_service.py            # review_queue 读写服务（本项目新增，通用文档 RAG 无对应）
+│       ├── dashboard/                   # Web Dashboard (可视化管理平台)
+│       │   ├── __init__.py
+│       │   ├── app.py                   # Streamlit 入口 (页面导航注册)
+│       │   ├── pages/                   # 七大功能页面
+│       │   │   ├── overview.py           # 系统总览
+│       │   │   ├── question_browser.py   # 题库浏览器（对应通用文档 RAG 的 data_browser）
+│       │   │   ├── ingestion_manager.py  # 数据摄取管理
+│       │   │   ├── review_queue.py       # 待审核队列（本项目新增，Tab A 待审提议/Tab B taxonomy 浏览）
+│       │   │   ├── evaluation_panel.py   # 评估面板（Tab A 反馈汇总/Tab B 指标运行）
+│       │   │   ├── ingestion_traces.py   # Ingestion 追踪
+│       │   │   └── query_traces.py       # Query 追踪
+│       │   └── services/                # Dashboard 数据服务层
+│       │       ├── trace_service.py     # Trace 读取服务 (解析 traces.jsonl)
+│       │       ├── data_service.py      # 数据浏览服务 (VectorStore 读取)
+│       │       └── config_service.py    # 配置读取服务 (Settings 展示)
+│       └── evaluation/                  # 评估模块
+│           ├── __init__.py
+│           ├── eval_runner.py           # 评估执行器
+│           └── composite_evaluator.py   # 组合评估器（挂载自定义指标，预留未来扩展）
+│
+├── data/                                # 数据目录
+│   ├── documents/                       # 原始题库文档存放（PDF 来源）
+│   │   └── {chapter_code}/              # 按章节分类
+│   ├── images/                          # 题目关联图形文件存放
+│   │   └── {chapter_code}/              # 按章节分类（实际存储在 {question_id}/ 子目录下）
+│   └── db/                              # 数据库与索引文件目录（SQLite 持久化存储架构统一说明，见 §4.1）
+│       ├── ingestion_history.db         # 文件完整性历史记录 (SQLite)
+│       │                                # 表结构：input_hash, source_type, status, processed_at, error_msg, question_count
+│       │                                # 用途：增量摄取，避免重复处理未变更输入
+│       ├── image_index.db               # 图片索引映射 (SQLite)
+│       │                                # 表结构：image_id, file_path, question_id
+│       │                                # 用途：快速查询 image_id → 本地文件路径，支持检索命中后返回图形
+│       ├── chroma/                      # Chroma 向量库目录
+│       │                                # 存储 Dense Vector、Question 原文与 Metadata（All-in-One 存储策略，见 §4.1）
+│       └── bm25/                        # BM25 索引目录
+│                                        # 存储倒排索引与 IDF 统计信息（当前使用 pickle）
+│
+├── cache/                               # 缓存目录
+│   ├── embeddings/                      # Embedding 缓存 (按内容哈希，差量计算)
+│   └── recognition/                     # 图片识别结果缓存 (按图片内容哈希，见 §4.6 幂等与增量处理)
+│
+├── logs/                                # 日志目录
+│   ├── traces.jsonl                     # 追踪日志 (JSON Lines，Query Trace + Ingestion Trace 双链路)
+│   └── app.log                          # 应用日志
+│
+├── tests/                               # 测试目录（覆盖范围见 §5）
+│   ├── unit/                            # 单元测试
+│   │   ├── test_loaders.py              # Loader 多题目边界识别/置信度标记测试
+│   │   ├── test_transform.py            # Transform 去噪/语义元数据/Vision LLM降级测试
+│   │   ├── test_embedding.py            # Embedding 差量计算/批处理测试
+│   │   ├── test_hybrid_search.py        # Retrieval reference_stem两态/多路径加分测试
+│   │   ├── test_reranker_fallback.py    # Reranker Fallback回退与显式标记测试
+│   │   └── test_review_gate.py          # Review-Gate 待审内容不可见性测试
+│   ├── integration/                     # 集成测试
+│   │   ├── test_ingestion_pipeline.py   # Loader→Transform→Embedding→Upsert 完整流程
+│   │   ├── test_hybrid_search.py        # Dense+Sparse 融合集成测试（含 reference_stem 有/无）
+│   │   └── test_mcp_server.py           # MCP 七工具端到端测试
+│   ├── e2e/                             # 端到端测试
+│   │   ├── test_question_ingestion.py   # 三种录入来源场景
+│   │   ├── test_recall.py               # 结构化召回回归测试
+│   │   └── test_mcp_client.py           # 模拟辅导讲师 Agent 测试
+│   └── fixtures/                        # 测试数据
+│       ├── sample_questions/            # 测试题目样本（覆盖不同章节/难度）
+│       └── golden_test_set.json         # 黄金测试集
+│
+├── scripts/                             # 脚本目录
+│   ├── ingest.py                        # 数据摄取脚本（离线批量导入入口）
+│   ├── query.py                         # 检索测试脚本（在线查询入口）
+│   ├── evaluate.py                      # 评估运行脚本
+│   └── start_dashboard.py               # Dashboard 启动脚本
+│
+├── main.py                              # MCP Server 启动入口
+├── pyproject.toml                       # Python 项目配置
+├── requirements.txt                     # 依赖列表
+└── README.md                            # 项目说明
+```
+
+**与通用文档 RAG 目录结构的关键差异**：
+
+- **不做 Chunking**：去掉了 `chunking/`、`splitter/` 整个模块目录及对应工厂（`libs/splitter/`），Ingestion Pipeline 只有 Loader→Transform→Embedding→Upsert 四步。
+- **`query_engine/` → `retrieval_engine/`**：去掉 `query_processor.py`（结构化输入不需要关键词提取/查询扩展），Multi-stage Filtering 的前置/后置过滤拆成两个独立文件 `pre_filter.py`/`post_filter.py`（对应 §4.2 中两个物理上不相邻的过滤阶段，中间夹着整个 Hybrid Search，不合并成一个文件）。
+- **Vision LLM 独立目录**：按 §4.4 决策单独建 `libs/vision_llm/`，不塞进 `libs/llm/`，因为 `BaseVisionLLM` 是与 `LLMClient` 并列的独立抽象接口，不是 LLM Factory 的子选项。
+- **新增 `review_service.py`、`review_queue.py` 页面**：对应本项目独有的 Review-Gate 机制，通用文档 RAG 无对应设计。
+- **`ragas_evaluator.py` 全部移除**：`libs/evaluator/` 和 `observability/evaluation/` 目录都只保留自定义指标实现，不引入 Ragas（理由见 `docs/DECISIONS.md`「评估框架选型」）。
+- **Prompt 模板去掉 `chunk_refinement.txt`**（无 Chunk 概念），新增 `image_recognition.txt`（对应 §4.6 分类型识别 Prompt）。
 
 ---
