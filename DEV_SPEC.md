@@ -153,9 +153,13 @@ CREATE INDEX idx_status ON ingestion_history(status);
 >
 > | 存储模块 | 数据库文件 | 用途 | 表结构关键字段 |
 > |---------|-----------|------|---------------|
-> | **文件完整性检查** | `data/db/ingestion_history.db` | 记录已处理输入的 SHA256 哈希，实现增量摄取 | `input_hash`, `status`, `processed_at` |
-> | **图片索引映射** | `data/db/image_index.db` | 记录题目关联图形文件的 `image_id → 文件路径` 映射，支持图片检索与引用 | `image_id`, `file_path`, `question_id` |
+> | **文件完整性检查** | `data/db/app.db` | 记录已处理输入的 SHA256 哈希，实现增量摄取 | `input_hash`, `status`, `processed_at` |
+> | **图片索引映射** | `data/db/app.db` | 记录题目关联图形文件的 `image_id → 文件路径` 映射，支持图片检索与引用 | `image_id`, `file_path`, `question_id` |
+> | **题目关系元数据镜像** | `data/db/app.db` | `questions_meta`：Chroma 中题目数据的轻量 SQLite 镜像，仅存关系查询字段（不含 `stem`/`answer`/向量），供其余关系表建立可生效的外键（见 §7.3） | `id`, `chapter_code`, `subject_code`, `difficulty` |
+> | **Taxonomy 与 Review-Gate** | `data/db/app.db` | `canonical_steps`/`misconception_tags`/`step_misconception_map`/`question_step_paths`/`question_step_path_steps`/`review_queue`/`recommendation_feedback`（完整定义见 §7.3-7.5） | 详见 §7 |
 > | **BM25 索引元数据** | `data/db/bm25/` | 存储倒排索引和 IDF 统计信息（未来可扩展用 SQLite） | 当前使用 pickle，可迁移至 SQLite |
+>
+> **物理文件归属说明**：`ingestion_history`/`ingestion_records`/`image_index`/`questions_meta` 及 §7 全部关系型表统一存放于同一个 SQLite 文件 `data/db/app.db`（而非早期设计里分散的独立 `.db` 文件）——SQLite 的外键约束只在同一数据库文件内生效，跨文件的 `REFERENCES` 物理上不可能兑现，本项目所有表间外键引用均以"同库"为前提，见 §7 开头的 `PRAGMA foreign_keys` 项目立场声明。
 >
 > **设计优势**：
 > - **零依赖部署**：无需安装 MySQL/PostgreSQL 等数据库服务，`pip install` 即可运行——对应本项目"个人可维护、可部署到教育机构本地环境"的定位。
@@ -204,6 +208,8 @@ CREATE INDEX idx_status ON ingestion_history(status);
     2. **`ingestion_records`** — 删除对应摄取记录
     3. **`ingestion_history`** — 若该题目是某次摄取的唯一产出，移除处理记录，使原始输入可重新摄取
     4. **图片文件**（若有）— 删除关联的题目图形文件
+    5. **`question_step_path_steps` + `question_step_paths`**（见 §7.3）— 先删展开表再删主表，清理该题目关联的全部标准步骤路径；缺失此步会在启用 `PRAGMA foreign_keys=ON` 时导致删除因外键约束（默认 RESTRICT）失败，或在未启用时留下指向已删除题目的孤儿路径行，被多路径命中加分逻辑继续计入
+    6. **`questions_meta`**（见 §7.3）— 删除对应镜像行；必须在第 5 步之后执行，因为 `question_step_paths`/`recommendation_feedback` 反过来引用 `questions_meta.id`
   - `get_chapter_stats(chapter_code?) -> ChapterStats`：返回章节级统计（题目数、待审核数、存储大小）。
 
 **Pipeline 进度回调**（与通用文档 RAG 一致，直接复用，支撑 Dashboard 摄取管理页的实时进度条）：
@@ -241,7 +247,7 @@ def run(self, source: Any, source_type: str,
 ```sql
 CREATE TABLE ingestion_records (
     id            TEXT PRIMARY KEY,
-    question_id   TEXT NOT NULL,      -- FK -> questions.id
+    question_id   TEXT NOT NULL,      -- FK -> questions_meta.id（questions 数据实际存于 Chroma，见 §7.3 questions_meta 镜像表说明）
     source_type   TEXT NOT NULL CHECK(source_type IN ('image', 'pdf', 'manual')),
     source_ref    TEXT,               -- 原始文件路径/引用，manual 来源可为空
     source_hint   TEXT,               -- 'student_realtime' | 'batch_scan'，仅 image 来源使用
@@ -276,7 +282,7 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
   - 无 `keywords`/`expanded_terms` 字段——这两个字段服务于自由文本查询的关键词提取/同义词扩展，本项目的核心结构化字段不需要这层转换。
 - **查询转换与扩张策略（对应通用文档 RAG 此节，本项目判定不适用）**：原版此节包含 Keyword Extraction（NLP 提取关键实体生成稀疏检索 Token）和 Query Expansion（同义词/别名扩展）两个机制，目的是把自由文本查询转化为适合检索的形式。本项目的核心结构化字段不需要这层转换；但 `reference_stem`（若提供）仍需要基础的分词/关键词提取供 Sparse Route 使用——这部分复用与通用文档 RAG 相同的 NLP 处理，只是触发条件从"总是执行"变成"仅当 `reference_stem` 存在时执行"。
 - **Metadata Filtering 完整策略**（与通用文档 RAG 一致，原则为"先解析、能前置则前置、无法前置则后置兜底"）：
-  - **硬过滤 / 前置（Pre-filter）**：`review_status != approved` 的题目、以及 `chapter_code`/`canonical_step_id` 不满足的候选，在 Dense/Sparse 检索阶段之前直接排除，不进入候选集——因为这些是索引层面可精确支持的结构化字段，前置能缩小候选集、降低成本。对应 `docs/DECISIONS.md`「技术选型验证」中确立的"结构化过滤 + 语义排序"分工原则。
+  - **硬过滤 / 前置（Pre-filter）**：`review_status != approved` 的题目、以及 `chapter_code`/`canonical_step_id` 不满足的候选，在 Dense/Sparse 检索阶段之前直接排除，不进入候选集——因为这些是索引层面可精确支持的结构化字段，前置能缩小候选集、降低成本。对应 `docs/DECISIONS.md`「技术选型验证」中确立的"结构化过滤 + 语义排序"分工原则。同一阶段还需校验传入的 `canonical_step_id` 在 `canonical_steps` 表中的 `status` 字段为 `'active'`（见 §7.3）——若命中的标准步骤已被老师标记 `'deprecated'`（事后判定为错误挖掘或废弃标准），视同"不存在于 taxonomy 中"处理，直接返回空结果 + 明确错误信息，不降级为模糊匹配；这一校验保证 Review-Gate 的"事后撤销"机制真正对检索生效，而不只是数据库里的一个孤立标记。
   - **硬过滤 / 后置（Post-filter，safety net）**：`misconception_tag_id`（可选字段，题目数据里可能缺失该标注）在 Rerank 前统一做后置过滤——若题目未标注错因标签，默认"宽松包含"（missing→include），不因标注缺失而误杀本该召回的候选，避免因数据标注不完整导致漏检。
   - **软偏好（Soft Preference）**：`difficulty` 不做硬过滤（学生错因对应的标准步骤，难度相近但不完全相等的题目依然有练习价值），而是作为 Rerank 阶段的排序信号之一参与加权（对应"难度匹配"这一分项，见下方 Rerank 权重）。
 - **Hybrid Search Execution（双路混合检索）**：
@@ -347,7 +353,7 @@ CREATE INDEX idx_batch_id ON ingestion_records(batch_id);
 | 提议写入 | `propose_canonical_step` | 提议新标准步骤 | 候选步骤内容 | 确认信息 + 提议记录 ID |
 | 提议写入 | `propose_misconception_tag` | 提议新错因标签 | 候选标签内容 | 确认信息 + 提议记录 ID |
 | 提议写入 | `propose_question_mapping` | 提议题目与标准步骤的映射，粒度覆盖单步骤与整条路径 | `question_id`, `step_ids`（长度 1 为单步骤映射，长度 >1 为路径提议） | 确认信息 + 提议记录 ID |
-| 反馈回流 | `submit_recommendation_feedback` | 记录学生/老师对某次推荐结果的反馈，作为未来 Rerank 权重迭代的数据来源 | `case_id`（对应某次检索结果）, `question_id`, `feedback`（有帮助/无帮助等） | 确认信息 |
+| 反馈回流 | `submit_recommendation_feedback` | 记录学生/老师对某次推荐结果的反馈，作为未来 Rerank 权重迭代的数据来源 | `case_id`（对应某次检索结果）, `question_id`, `feedback`（有帮助/无帮助等）, `submitted_by`（`"student"` \| `"teacher"`，辅导讲师 Agent 从自身对话上下文中判断这次反馈代表谁提交，见 §7.5） | 确认信息 |
 
   - 所有"提议写入"与"反馈回流"类工具**只返回简洁确认（成功与否 + 对应记录 ID），不返回审核状态或详细内容**——调用方（辅导讲师 Agent）不需要在当前对话轮次追踪审核进度，这是本项目与通用文档 RAG 工具设计的一个刻意简化。
   - 所有提议写入类工具的返回内容，一律写入 `review_queue`（见 §7 数据模型），`review_status=pending`，审核通过前对检索完全不可见（硬规则，见 `docs/DECISIONS.md`「Review-Gate 规则」）。
@@ -617,7 +623,7 @@ src/observability/dashboard/
 ┌─────────────────────────────────────────────────────────┐
 │  Storage 阶段：双轨存储                                     │
 │  - 向量库：存储结构化后的题目文本，用于检索                    │
-│  - 图片索引（image_index.db，见 §4.1）：存储原始图片文件路径，  │
+│  - 图片索引（app.db 图片索引表，见 §4.1）：存储原始图片文件路径，  │
 │    用于检索命中后返回图形给辅导讲师 Agent                      │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -640,7 +646,7 @@ src/observability/dashboard/
 
 **3. Storage 阶段：双轨存储**
 
-- 与 §4.1 Upsert 阶段一致：向量库存储结构化后的题目文本（用于检索），`image_index.db`（见 §4.1 SQLite 统一说明）存储原始图片文件路径（用于命中后返回图形）。
+- 与 §4.1 Upsert 阶段一致：向量库存储结构化后的题目文本（用于检索），`app.db` 图片索引表（见 §4.1 SQLite 统一说明）存储原始图片文件路径（用于命中后返回图形）。
 
 **检索与返回流程**：
 
@@ -653,7 +659,7 @@ src/observability/dashboard/
 Hybrid Search 命中题目（question.image_ref 非空）
     │
     ▼
-查询 image_index.db，获取图片文件路径
+查询 app.db 的图片索引表，获取图片文件路径
     │
     ▼
 读取图片文件，编码为 Base64
@@ -729,7 +735,7 @@ Hybrid Search 命中题目（question.image_ref 非空）
 | **MCP Server** | 7 个工具（查询/检索/图片感知转换/提议写入/反馈回流五类）的端到端流程 | - 模拟 MCP Client 发送 JSON-RPC 请求<br>- 验证 `search_questions` 返回的 `content`/`structuredContent` 格式符合 §4.3 设计<br>- 验证 `propose_*` 类工具写入后进入 `review_queue` 且 `review_status=pending`<br>- 测试错误处理（如传入不存在的 `canonical_step_id`，见 §4.2"不做模糊匹配或猜测"） |
 
 **技术选型**：
-- **数据隔离**：每个测试使用独立的临时 SQLite 库/向量库（`pytest-tempdir`），覆盖 `ingestion_history.db`/`image_index.db` 等（见 §4.1 SQLite 持久化存储架构统一说明）
+- **数据隔离**：每个测试使用独立的临时 SQLite 库/向量库（`pytest-tempdir`），覆盖 `app.db` 等（见 §4.1 SQLite 持久化存储架构统一说明）
 - **异步测试**：`pytest-asyncio`（若 MCP Server 采用异步实现）
 - **契约测试**：定义 `ProcessedQuery`/`RetrievalResult`/`Question` 等核心数据类型的 Schema，确保接口不漂移
 
@@ -940,6 +946,11 @@ Hybrid Search 命中题目（question.image_ref 非空）
 │    │    本地文件系统 | Base64 编码     │    │   独立表，见 §7 数据模型）         │             │
 │    └──────────────────────────────────┘    └──────────────────────────────────┘             │
 │    ┌──────────────────────────────────────────────────────────────────────────────────┐     │
+│    │  questions_meta（SQLite 轻量镜像，仅 id/chapter_code/subject_code/difficulty，    │     │
+│    │  不含 stem/答案/向量；供 question_step_paths/recommendation_feedback 建立可真正    │     │
+│    │  生效的外键，因 Chroma 与 SQLite 是不同数据库文件，见 §7.3）                       │     │
+│    └──────────────────────────────────────────────────────────────────────────────────┘     │
+│    ┌──────────────────────────────────────────────────────────────────────────────────┐     │
 │    │                     Trace Logs (追踪日志，JSON Lines 格式文件)                       │     │
 │    │       Query Trace（来自上方 Core 层 TraceContext）+                                 │     │
 │    │       Ingestion Trace（来自下方 Ingestion Pipeline，双链路追踪的另一条链路）           │     │
@@ -1079,7 +1090,8 @@ rag-math-qb/
 │   │       ├── __init__.py
 │   │       ├── vector_upserter.py       # 向量库 Upsert（幂等，原子性保证）
 │   │       ├── bm25_indexer.py          # BM25 索引构建
-│   │       └── image_storage.py         # 图片文件存储
+│   │       ├── image_storage.py         # 图片文件存储
+│   │       └── questions_meta_writer.py # questions_meta 镜像同步（见 §7.3）
 │   │
 │   ├── libs/                            # Libs 层 (可插拔抽象层，见 §4.4)
 │   │   ├── __init__.py
@@ -1163,12 +1175,11 @@ rag-math-qb/
 │   ├── images/                          # 题目关联图形文件存放
 │   │   └── {chapter_code}/              # 按章节分类（实际存储在 {question_id}/ 子目录下）
 │   └── db/                              # 数据库与索引文件目录（SQLite 持久化存储架构统一说明，见 §4.1）
-│       ├── ingestion_history.db         # 文件完整性历史记录 (SQLite)
-│       │                                # 表结构：input_hash, source_type, status, processed_at, error_msg, question_count
-│       │                                # 用途：增量摄取，避免重复处理未变更输入
-│       ├── image_index.db               # 图片索引映射 (SQLite)
-│       │                                # 表结构：image_id, file_path, question_id
-│       │                                # 用途：快速查询 image_id → 本地文件路径，支持检索命中后返回图形
+│       ├── app.db                       # 统一 SQLite 文件，承载 ingestion_history/ingestion_records/
+│       │                                # image_index/questions_meta 及 §7 全部关系型表（canonical_steps/
+│       │                                # misconception_tags/step_misconception_map/question_step_paths/
+│       │                                # question_step_path_steps/review_queue/recommendation_feedback）
+│       │                                # 统一存放同一文件是外键约束生效的前提，见 §4.1/§7 说明
 │       ├── chroma/                      # Chroma 向量库目录
 │       │                                # 存储 Dense Vector、Question 原文与 Metadata（All-in-One 存储策略，见 §4.1）
 │       └── bm25/                        # BM25 索引目录
@@ -1277,7 +1288,8 @@ rag-math-qb/
 | `embedding/batch_processor.py` | 批处理优化 | `batch_size` 驱动的批量调用，减少网络 RTT |
 | `storage/vector_upserter.py` | 向量存储写入 | 通过 `libs.vector_store` Upsert；幂等；All-in-One 存储，metadata 完整 |
 | `storage/bm25_indexer.py` | BM25 索引构建 | 倒排索引写入，驱动 `sparse_retriever.py` 检索计算；提供 `remove_document()` 供 `question_manager.py` 删除时调用 |
-| `storage/image_storage.py` | 图片文件存储 | 本地文件系统写入，`image_index.db` 索引映射维护 |
+| `storage/image_storage.py` | 图片文件存储 | 本地文件系统写入，`app.db`（图片索引表） 索引映射维护 |
+| `storage/questions_meta_writer.py` | `questions_meta` 镜像同步 | Upsert 阶段 Chroma 写入成功后同步写入（先 Chroma 后镜像，见 §7.3 双写机制）；`question_manager.py` 删除题目时（第六步）调用对应删除接口 |
 
 #### 6.3.5 Libs 层（可插拔抽象）
 
@@ -1287,7 +1299,7 @@ rag-math-qb/
 | `VisionLLMClient`（独立接口，非 `LLMClient` 子选项） | 占位跑通链路用任一可用 Vision LLM，正式选型（按任务类型路由）为待解锁任务，见 §8 | 具体模型对比见 `docs/DECISIONS.md`「Vision LLM 选型策略」 |
 | `EmbeddingClient` | 占位跑通链路用 OpenAI text-embedding-3 或 Ollama 本地模型，正式选型为待解锁任务，见 §8 | OpenAI / BGE / Ollama 本地模型 |
 | `Loader` | PdfLoader / ImageLoader / ManualEntryLoader（三种来源并存，非互相替代） | 未来可扩展新的录入来源 |
-| `FileIntegrity` | SQLite (`data/db/ingestion_history.db`) | Redis（分布式）/ PostgreSQL（企业级） |
+| `FileIntegrity` | SQLite (`data/db/app.db`) | Redis（分布式）/ PostgreSQL（企业级） |
 | `VectorStore` | Chroma | Qdrant / Pinecone |
 | `Reranker` | None（Top-K 默认） | Cross-Encoder / LLM Rerank |
 | `Evaluator` | 自定义检索指标（Hit Rate/MRR） | 不含 Ragas，见 `docs/DECISIONS.md`「评估框架选型」 |
@@ -1439,7 +1451,10 @@ Dashboard (Streamlit UI)
       │    │   ├── ingestion_records 删除对应摄取记录           │
       │    │   ├── ingestion_history（若为唯一产出）→          │
       │    │   │   FileIntegrity.remove_record(input_hash)    │
-      │    │   └── ImageStorage 删除关联图片文件（若有）        │
+      │    │   ├── ImageStorage 删除关联图片文件（若有）        │
+      │    │   └── question_step_path_steps + question_step_ │
+      │    │       paths 清理关联路径（见 §7.3，防孤儿数据/   │
+      │    │       外键约束失败）                              │
       │    └── 刷新题目列表                                    │
       │                                                       │
       ├─── 待审核队列 ────────────────────────────────────────┤
@@ -1461,7 +1476,7 @@ Dashboard (Streamlit UI)
 
 - **6.4.1**：Loader 从单一 PDF 换成三种来源并列，去掉 Splitter 阶段，Transform 阶段的三个动作对应 §4.1/§4.6 的实际触发条件。
 - **6.4.2**：去掉 Query Processor（输入已结构化），新增 Pre-Filter/Post-Filter 两个显式阶段（对应 §4.2 Multi-stage Filtering），Dense/Sparse 双路标注了 `reference_stem` 条件分支，Fusion 标注单路降级逻辑，Rerank 标注多路径加分与 Fallback 强制显式标记（`used_fallback`/`fallback_reason`）；每个阶段各自调用 `TraceContext.record_stage()`，非流程末尾统一记录。
-- **6.4.3**：题库浏览管道改经 `data_service.py` 封装的 VectorStore 抽象读取，不直接点名具体实现类；`delete_question()` 按 §4.1 原文改为四步（VectorStore 删除含 dense/sparse、`ingestion_records` 删除、`ingestion_history` 处理记录移除、图片文件删除），`BM25Indexer.remove_document()` 是 VectorStore 删除步骤里 sparse 一侧的具体接口，不是独立并列步骤；新增"待审核队列"管道（本项目独有，对应 Review-Gate 机制）；"Trace 查看"管道复用已有 `trace_service.py` 机制，非新设计。
+- **6.4.3**：题库浏览管道改经 `data_service.py` 封装的 VectorStore 抽象读取，不直接点名具体实现类；`delete_question()` 按 §4.1 原文改为五步（VectorStore 删除含 dense/sparse、`ingestion_records` 删除、`ingestion_history` 处理记录移除、图片文件删除、`question_step_path_steps`/`question_step_paths` 路径关联清理——第五步为 §7 数据模型审查后新增，避免题目删除后遗留孤儿路径数据或触发外键约束失败），`BM25Indexer.remove_document()` 是 VectorStore 删除步骤里 sparse 一侧的具体接口，不是独立并列步骤；新增"待审核队列"管道（本项目独有，对应 Review-Gate 机制）；"Trace 查看"管道复用已有 `trace_service.py` 机制，非新设计。
 
 ---
 
@@ -1542,5 +1557,213 @@ dashboard:
 
 - **6.5**：`chunk_size`/`chunk_overlap`/Splitter 相关字段全部移除（不做 Chunking）；`llm`/`embedding`/`vision_llm`/`dashboard.port` 具体 provider 与参数值统一改为 `TODO` 占位（对应 §4.4/§4.6 已明确"具体选型为待解锁任务"的决策）；`rerank.multi_path_bonus` 按 §4.2 原文要求用具体小值占位（0.05，对应 §4.3 `score_breakdown` 示例）而非留空 TODO，避免链路因非数值字段跑不通；`rerank` 从 §4.4 中 `retrieval.rerank_backend` 平级字段拆分为独立配置块，聚合新增的 `top_m`/`multi_path_bonus` 等 rerank 专属参数；`observability` 补全 §4.5 已确定的三层结构（`logging.log_file`/`log_level` + `detail_level`），不再拍平成单一 `log_file`；`retrieval.top_n`/`top_k` 为本项目新增/沿用字段，非照搬 §4.2 原文字段名，`top_k` 语义上对应 `ProcessedQuery.top_k` 未传时的全局默认值；`evaluation.backends` 去掉 `ragas`。
 - **6.6**：去掉"新增文档格式"（改为"新增录入来源"，按 `source_type` 而非文件扩展名区分）；新增第 5 条"新增学科/章节"（本项目特有的可扩展性维度，对应 `docs/DECISIONS.md`「数据结构可扩展性：不限定学科」）。
+
+---
+
+## 7. 数据模型
+
+**目标：** 本节是全项目唯一权威的数据结构定义来源，覆盖两类内容：（1）已在 §4.1/§4.2 就地定义、此处汇总呈现的题目相关类型（`Question`/`QuestionRecord`/`ProcessedQuery`/`RetrievalResult`）；（2）此前仅在 `docs/DECISIONS.md` 确立了关系层面决策、但从未给出字段级定义的跨模块共享表（`canonical_steps`/`misconception_tags`/`question_step_paths`/`question_step_path_steps`/`step_misconception_map`/`review_queue`/`recommendation_feedback`）——这几张表被摄取、检索、MCP 提议工具、Dashboard 审核页多个模块共同读写，字段定义必须收敛到唯一出处，其余章节引用时指回本节，不再各自隐含定义。
+
+**外键约束的项目立场**：本项目**全局假设 `PRAGMA foreign_keys=ON`**（SQLite 默认关闭，需在连接初始化时显式启用）——本节下述所有 `REFERENCES` 外键均依赖这一前提生效（默认行为 RESTRICT，阻止删除仍被引用的父行）。这一立场直接影响 §4.1/§6.4 `delete_question()` 的实现顺序：必须先清理 `question_step_path_steps`/`question_step_paths`（子表）、再清理 `questions_meta`，否则对仍有关联路径的题目执行删除会因外键约束直接报错失败，而不是静默留下孤儿数据。
+
+### 7.1 题目相关类型（已在 §4.1/§4.2 定义，本节仅汇总，字段以原处为准）
+
+- **`Question`**（见 §4.1）：`id`/`stem`/`answer`/`metadata`（含 `chapter_code`/`subject_code`/`difficulty`/`review_status`/`source_ref`）/`image_ref`
+- **`QuestionRecord`**（见 §4.1）：继承 `Question` 全部字段 + `dense_vector`/`sparse_vector`
+- **`ProcessedQuery`**（见 §4.2）：`canonical_step_id`/`misconception_tag_id`/`chapter_code`/`difficulty`/`top_k`/`exclude_question_ids`/`reference_stem`
+- **`RetrievalResult`**（见 §4.2）：`question_id`/`score`/`stage_scores`/`matched_path_ids`/`metadata`，最终返回补充 `score_breakdown`/`why_recommended`
+
+### 7.2 摄取相关表（已在 §4.1 定义，本节仅汇总）
+
+- **`questions` 数据（存于 Chroma，非 SQLite）**：`Question`/`QuestionRecord` 的持久化落点，通过 Chroma 的 All-in-One 存储策略实现（见 §4.1），字段同 §7.1。**不是**一张可被 SQL `REFERENCES` 的关系表——需要与题目建立关系引用的 SQLite 表，一律引用 §7.3 的 `questions_meta` 镜像表，不能直接引用 Chroma 里的数据。
+- **`ingestion_history` 表**（见 §4.1）：`input_hash`/`source_type`/`status`/`processed_at`/`error_msg`/`question_count`
+- **`ingestion_records` 表**（见 §4.1）：`id`/`question_id`（FK → `questions_meta.id`）/`source_type`/`source_ref`/`source_hint`/`imported_by`/`imported_at`/`batch_id`
+
+### 7.3 Taxonomy 表与 questions_meta 镜像表（首次正式定义，此前仅在 DECISIONS.md 确立关系）
+
+**`questions_meta` 表**（Chroma 中题目数据的轻量 SQLite 镜像，职责收窄：仅用于让 SQLite 侧的关系表能对题目 ID 做真正生效的外键完整性校验，不涉及 `review_status` 判断、题目内容展示、检索排序——这些职责继续以 Chroma 为唯一数据源）：
+
+```sql
+CREATE TABLE questions_meta (
+    id                TEXT PRIMARY KEY,        -- 与 Chroma 中 Question.id 一致
+    chapter_code      TEXT NOT NULL,
+    subject_code      TEXT NOT NULL,
+    difficulty        INTEGER,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_chapter_code_meta ON questions_meta(chapter_code);
+```
+
+**用途边界说明**：本表**仅**用于让 `question_step_paths`/`recommendation_feedback` 能对题目 ID 做真正的外键完整性校验（防止路径/反馈指向不存在的题目 ID）。`review_status` 判断（见 §4.2 Pre-Filter）、题目内容展示（`stem`/`answer`）、检索排序等所有业务逻辑，继续以 Chroma 为唯一数据源，`questions_meta` 不参与、不重复这些职责——`data_service.py` 展示反馈详情等场景仍需回查 Chroma 获取题面摘要，镜像表不能替代这类查询。若评估面板展示反馈时关联题目当前 `review_status` 已不是 `approved`（如题目审核后被撤下），具体降级展示逻辑留待 `data_service.py` 实现阶段确定——V1 数据规模下预期此边界情况极少发生，暂不在此展开。
+
+**同步写入机制**：Upsert 阶段（见 §4.1/§6.4.1），**先写 Chroma（All-in-One，含 dense/sparse/metadata 的批处理原子写入，见 §4.1 已有的"原子性保证"），Chroma 写入成功后再写 `questions_meta`**。若 `questions_meta` 写入失败，题目在 Chroma 中已存在但 SQLite 侧无镜像行——摄取流程判定为**整体失败**（返回错误，`ingestion_history` 记录 `status='failed'`），不视为"部分成功"，需要重新触发该题目的摄取；利用 §4.1 已有的幂等性设计，`Question.id` 基于内容哈希确定性生成，重新摄取时 Chroma 侧 Upsert 语义天然幂等，`questions_meta` 侧写入采用等价于 `INSERT OR REPLACE` 的语义保证重试安全。
+
+**审核机制说明（关键，避免与 `questions`/`questions_meta` 混淆）**：本节其余三张表（`canonical_steps`/`misconception_tags`/`question_step_paths`）的记录**只在 `review_queue` 提议被 approve 时才产生**——提议内容在 approve 前以 JSON 形式暂存于 `review_queue.payload`，approve 时才执行 INSERT，因此这三张表里的每一行天然都是"已审核通过"状态，不存在 pending 行，故均不含 `review_status` 字段。这与 `questions.metadata.review_status`（摄取阶段即产生 pending 行，走独立的题库浏览器审核路径，不经过 `review_queue`）是两套不同机制，不要混淆。
+
+三张表均新增 `status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deprecated'))` 字段，供老师事后撤销已批准但发现有误的记录（这不是被移除的 `review_status`——不含 `pending` 值，不会复现原来的时序矛盾）。`canonical_steps.status='deprecated'` 时，§4.2 Pre-Filter 阶段会将命中该步骤的查询视同"步骤不存在"直接拒绝（见 §4.2 原文），确保这个标记对检索真正生效，不是孤立的数据库字段。`misconception_tags`/`question_step_paths` 的 `status` 字段目前仅供 Dashboard 展示/人工判断参考，**尚未接入 §4.2 检索过滤逻辑**——错因标签或路径被标记 deprecated 后，检索链路暂不会自动排除，这是当前版本的已知限制（后续需要与 `misconception_tag_id` 后置过滤、多路径命中加分逻辑一并接入，属于待解锁任务，见 §8）。
+
+**`canonical_steps` 表**（标准步骤库，AI 挖掘候选+人工审核确认，见 `docs/DECISIONS.md`「标准步骤库冷启动策略」）：
+
+```sql
+CREATE TABLE canonical_steps (
+    id                TEXT PRIMARY KEY,
+    subject_code      TEXT NOT NULL,          -- 学科维度，V1 恒为 'math'，字段本身不限定学科
+    chapter_code      TEXT NOT NULL,
+    description       TEXT NOT NULL,           -- 标准步骤的自然语言描述
+    source            TEXT NOT NULL CHECK(source IN ('ai_mined', 'manual')),  -- 挖掘来源
+    source_review_id  TEXT REFERENCES review_queue(id),  -- 来源提议溯源，source='manual' 时为空
+    status            TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deprecated')),
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_chapter_code ON canonical_steps(chapter_code);
+CREATE INDEX idx_status_steps ON canonical_steps(status);
+```
+
+**`misconception_tags` 表**（错因标签库，全局独立表，见 `docs/DECISIONS.md`「misconception_tags 是全局独立表」）：
+
+```sql
+CREATE TABLE misconception_tags (
+    id                TEXT PRIMARY KEY,
+    label             TEXT NOT NULL,           -- 错因标签名称
+    description       TEXT,                    -- 补充说明，可为空
+    source_review_id  TEXT REFERENCES review_queue(id),  -- 来源提议溯源，可为空
+    status            TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deprecated')),
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_label ON misconception_tags(label);  -- 防止字面重复创建；仅防字面重复，不防语义重复标签（如"忽略勾股定理适用条件"与"未验证直角三角形前提"），当前依赖老师审核时人工比对 Tab B 已有标签列表识别语义重复，后续若标签规模增长可考虑挖掘阶段引入相似度去重建议，转入待解锁任务。
+```
+
+**`step_misconception_map` 表**（步骤-错因多对多关联表，见 `docs/DECISIONS.md`「misconception_tags 是全局独立表」）：
+
+```sql
+CREATE TABLE step_misconception_map (
+    canonical_step_id     TEXT NOT NULL REFERENCES canonical_steps(id),
+    misconception_tag_id  TEXT NOT NULL REFERENCES misconception_tags(id),
+    PRIMARY KEY (canonical_step_id, misconception_tag_id)
+);
+```
+
+**`question_step_paths` 表**（题目-路径多对多关联表，多路径共存模型，见 `docs/DECISIONS.md`「题目与标准步骤支持多对多关联」）：
+
+```sql
+CREATE TABLE question_step_paths (
+    id                TEXT PRIMARY KEY,
+    question_id       TEXT NOT NULL REFERENCES questions_meta(id),
+    path_id           TEXT NOT NULL,           -- 同一题目下路径序号（如 path_001，从 001 递增），非全局唯一
+    step_sequence     TEXT NOT NULL,           -- 有序 canonical_step_id 列表，JSON 数组存储，供展示读取；与 question_step_path_steps 的一致性仅靠应用层事务约定（approve 时同一事务内写两张表），无数据库层强制（触发器/生成列在 SQLite 上投入产出比不高，V1 规模下接受此限制）
+    source_review_id  TEXT REFERENCES review_queue(id),
+    status            TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'deprecated')),
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_question_path ON question_step_paths(question_id, path_id);
+```
+
+**`question_step_path_steps` 表**（路径-步骤展开表，供检索路径命中判断走索引查询，`step_sequence` JSON 字段的查询优化冗余）：
+
+```sql
+CREATE TABLE question_step_path_steps (
+    path_id            TEXT NOT NULL REFERENCES question_step_paths(id),
+    canonical_step_id  TEXT NOT NULL REFERENCES canonical_steps(id),
+    sequence_order      INTEGER NOT NULL,       -- 该步骤在路径中的顺序，从 0 开始
+    PRIMARY KEY (path_id, canonical_step_id)
+);
+CREATE INDEX idx_canonical_step_id ON question_step_path_steps(canonical_step_id);
+```
+
+（`RetrievalResult.matched_path_ids` 引用的即是 `question_step_paths.id`；§4.2"路径命中判断与加分"逻辑查询 `question_step_path_steps`（`WHERE canonical_step_id = ?`，走 `idx_canonical_step_id` 索引）反查命中的 `path_id`/`question_id`，命中同一题目下多条路径则触发多路径加分——这是实际检索查询路径，`question_step_paths.step_sequence` 的 JSON 数组仅用于 Dashboard 展示完整路径序列，不参与检索查询。approve 一条路径提议时需同时写入两张表：`question_step_paths`（JSON 展示字段）与 `question_step_path_steps`（展开的可索引行），由 `review_service.py` 的 approve 处理逻辑保证同步。）
+
+**`chapter_code`/`subject_code` 说明**：当前 `canonical_steps.chapter_code` 与 `questions.metadata.chapter_code`/`questions_meta.chapter_code` 均为自由 TEXT，无共享章节参考表约束合法取值。V1 范围（单学科单起步章节，见 `docs/DECISIONS.md`「V1 学科/章节范围」）下碰撞风险接近零，可接受；但 `chapter_code` 是 §4.2 结构化前置过滤的硬过滤字段，拼写不一致会静默降低召回而不报错，扩展到多章节/多学科前（呼应 `docs/DECISIONS.md`「数据结构可扩展性」）需要引入独立的章节/学科参考表约束取值。
+
+### 7.4 Review-Gate 表（首次正式定义）
+
+**`review_queue` 表**（待审提议，审核前对检索完全不可见，见 `docs/DECISIONS.md`「Review-Gate 规则」）：
+
+```sql
+CREATE TABLE review_queue (
+    id                 TEXT PRIMARY KEY,
+    proposal_type      TEXT NOT NULL CHECK(proposal_type IN (
+                           'canonical_step', 'misconception_tag', 'question_mapping'
+                       )),                      -- 对应 propose_* 三个工具
+    payload            TEXT NOT NULL,           -- 提议内容，JSON 存储（结构随 proposal_type 变化）
+    status             TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected')),
+    proposed_by        TEXT NOT NULL DEFAULT 'agent' CHECK(proposed_by IN ('agent', 'teacher')),  -- 'teacher' 为未来 Dashboard 直接提议留口，V1 恒为 'agent'
+    source_session_ref TEXT,                    -- 触发本次提议的会话标识（学生/对话 trace），proposed_by='teacher' 时为空（老师直接提议无 Agent 会话可关联）；格式待解锁任务，依赖辅导讲师 Agent 会话标识设计确定
+    reviewed_by        TEXT,                    -- 审核老师标识，pending 状态为空
+    reviewed_at        TIMESTAMP,
+    payload_edited_at  TIMESTAMP,               -- 老师编辑 payload 的最后时间，NULL 表示未被编辑过，不引入新状态值
+    review_comment     TEXT,                    -- 老师 edit/reject 时的备注，可为空
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_status ON review_queue(status);
+CREATE INDEX idx_proposal_type ON review_queue(proposal_type);
+```
+
+**状态转移说明**：
+- **approve**：`UPDATE review_queue SET status='approved', reviewed_by=?, reviewed_at=NOW()`；同时把 `payload` 内容 INSERT 进 §7.3 对应正式表（`source_review_id` 指回本表 `id`）。若提议类型是"关联类"（`question_mapping` 涉及已有 `canonical_step_id`/`misconception_tag_id`，或路径提议涉及多个 `canonical_step_id`），approve 前必须在**同一事务内**校验其引用的 ID 已存在于对应正式表——不存在则阻止 approve 并提示"请先审核通过其依赖的标准步骤/错因标签"；校验与 INSERT 处于同一事务保证了 SQLite 单写者语义下的串行化，不需要额外的乐观锁机制（V1 单机部署规模下并发 approve 竞态不构成真实风险）。
+- **reject**：仅 `UPDATE review_queue SET status='rejected', reviewed_by=?, reviewed_at=NOW()`，不产生任何下游表写入。
+- **edit（不立即 approve）**：`UPDATE review_queue SET payload=?, payload_edited_at=NOW()`，`status` 保持 `pending`；Dashboard 列表可用 `payload_edited_at IS NOT NULL` 标记"已编辑待复核"，与"AI 原始提议未经编辑"区分展示。
+- **edit（编辑后立即 approve）**：先执行 edit 的 UPDATE，再执行 approve 流程，两步在同一事务内完成。
+
+### 7.5 反馈表（首次正式定义）
+
+**`recommendation_feedback` 表**（推荐结果反馈，驱动未来 Rerank 权重迭代，见 §4.2"权重公式为待解锁任务"）：
+
+```sql
+CREATE TABLE recommendation_feedback (
+    id                TEXT PRIMARY KEY,
+    case_id           TEXT NOT NULL,           -- 对应某次 search_questions 调用的 trace_id
+    question_id       TEXT NOT NULL REFERENCES questions_meta(id),
+    feedback          TEXT NOT NULL CHECK(feedback IN ('helpful', 'not_helpful')),
+    submitted_by      TEXT NOT NULL CHECK(submitted_by IN ('student', 'teacher')),  -- 由 submit_recommendation_feedback 工具的同名输入参数传入（辅导讲师 Agent 从对话上下文判断，见 §4.3）
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_case_id ON recommendation_feedback(case_id);
+CREATE INDEX idx_question_id_feedback ON recommendation_feedback(question_id);
+```
+
+**重要限制**：`case_id` 对应的 `trace_id` 仅存在于 `logs/traces.jsonl`（JSON Lines 日志文件，见 §4.5），不是数据库外键，**无法通过 SQL JOIN 关联**——`idx_case_id` 索引仅支持"按 `case_id` 过滤本表自身反馈记录"，不支撑跨表关联查询。若 §4.5 页面 5 Tab A 展示反馈详情时需要对照检索上下文，需应用层分别查询本表（SQLite）与解析对应 trace 日志（`trace_service.py` 读 `traces.jsonl`）后在内存中关联，不能假设这是一次普通的数据库 JOIN。
+
+### 7.6 实体关系图
+
+```
+                          ┌─────────────────────────────────┐
+                          │      questions（存于 Chroma）     │
+                          │   stem/answer/向量/完整 metadata  │
+                          └────────────────┬──────────────────┘
+                                           │ 摄取时同步写入（先 Chroma 后镜像，
+                                           │ 失败则整体判定摄取失败）
+                                           ▼
+                          ┌─────────────────────────────────┐
+                          │   questions_meta（SQLite 镜像）   │
+                          │ id/chapter_code/subject_code/    │
+                          │ difficulty；仅供外键完整性校验，   │
+                          │ 不涉及 review_status/内容展示     │
+                          └────────────────┬──────────────────┘
+                                           │
+                    ┌──────────────────────┼──────────────────────┐
+                    ▼                      ▼                      ▼
+          ingestion_records      question_step_paths    recommendation_feedback
+         （来源溯源，FK→meta）   （多对多路径，FK→meta）  （FK→meta；case_id 伪外键，
+                                           │                不可JOIN，见§7.5）
+                                           ▼
+                                question_step_path_steps
+                                （展开表，供检索按 canonical_step_id
+                                 索引查询命中的路径，approve 时与
+                                 question_step_paths 同步写入）
+
+canonical_steps ──┬─── step_misconception_map ───┬── misconception_tags
+   (标准步骤库，     │      (多对多关联)              │    (错因标签库，全局，
+    status生效于      │                              │     status暂未接入检索)
+    §4.2检索过滤)     │                              │
+                   └── question_step_paths（见上）
+
+review_queue ──approve（含关联校验，同事务）──> 写入 canonical_steps / misconception_tags /
+   (待审提议，三类     question_step_paths + question_step_path_steps
+    payload；三态+                        （source_review_id 溯源）
+    payload_edited_at
+    支持edit不approve）
+
+ingestion_history（独立，记录去重历史，不参与上述外键网络）
+```
 
 ---
